@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stockagent.daily</string>
+
+    <!-- 每天 16:30 触发 (脚本内部会判断是否交易日, 非交易日自动跳过) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <!-- 错过执行时间(如休眠)时, 唤醒后补跑 -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>cd /Users/jojo/coding/stock_agent &amp;&amp; source .venv/bin/activate 2>/dev/null; python scripts/run_daily.py &gt;&gt; data/cache/logs/daily.log 2&gt;&amp;1</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jojo/coding/stock_agent/data/cache/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/jojo/coding/stock_agent/data/cache/logs/launchd.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jojo/coding/stock_agent</string>
+</dict>
+</plist>

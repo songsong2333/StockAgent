@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 数据 (体积大, 不入库)
+data/raw/
+data/qlib_data/
+data/cache/
+!data/cache/.gitkeep
+
+# 日志
+*.log
+
+# 系统
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# qlib/mlruns
+mlruns/

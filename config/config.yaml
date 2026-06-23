@@ -1,0 +1,88 @@
+# ============================================================
+# A股量化交易系统 全局配置
+# ============================================================
+
+# ---------------- 数据路径 ----------------
+paths:
+  raw_dir: data/raw            # akshare 原始数据(parquet)
+  qlib_dir: data/qlib_data     # qlib bin 格式数据
+  cache_dir: data/cache        # 财务/ST/持仓/日志等缓存
+  log_dir: data/cache/logs
+
+# ---------------- 数据采集 ----------------
+collector:
+  adjust: qfq                  # 复权方式: qfq前复权 / hfq后复权 / ""不复权
+  start_date: "2018-01-01"     # 历史数据起始日期
+  request_sleep: 0.8           # 每次请求间隔(秒), 避免被限
+  max_retries: 3               # 单股票失败重试次数
+  # 股票池过滤
+  exclude_st: true             # 剔除 ST/*ST
+  exclude_new_days: 252        # 剔除上市不足 N 个交易日的新股(约1年)
+  exclude_kcb: false           # 是否剔除科创板
+  exclude_cyb: false           # 是否剔除创业板
+  exclude_bj: true             # 剔除北交所(流动性差)
+
+# ---------------- qlib 数据集 ----------------
+qlib:
+  provider_uri: data/qlib_data
+  region: cn                   # cn / us
+
+# ---------------- 股票池 ----------------
+universe: config/watchlist.yaml   # 选股范围: watchlist文件路径 或 "all"(全市场)
+
+# ---------------- 因子与模型 ----------------
+model:
+  handler: alpha158            # 因子集: alpha158 (qlib内置158因子)
+  model_class: lgbm            # 模型: lgbm / linear
+  label: "Ref($close, -2) / Ref($close, -1) - 1"  # 预测目标: 次日收益
+  # 训练区间: 用2025年数据训练, 预测2026年
+  train_start: "2025-01-01"
+  train_end: "2025-09-30"
+  valid_start: "2025-10-01"
+  valid_end: "2025-12-31"
+  test_start: "2026-01-01"
+  test_end: "2026-06-19"
+
+# ---------------- 回测 ----------------
+backtest:
+  topk: 5                      # 持仓股票数 (股票池仅17只, 取头部5只)
+  n_drop: 1                    # 每次调仓最多替换数(TopkDropout)
+  benchmark: "SH000300"        # 基准指数(需采集, 见 index_collector)
+  # A股交易成本
+  commission_rate: 0.00025     # 佣金(双边万2.5)
+  min_commission: 5.0          # 单笔最低佣金(元)
+  stamp_duty: 0.001            # 印花税(卖出千1)
+  transfer_fee: 0.00002        # 过户费(双边万分之0.2)
+  slippage: 0.001              # 滑点
+  # 时机
+  trade_unit: 100              # 一手=100股
+  deal_price: open             # 成交价: open / close / vwap
+  t_plus_1: true               # T+1
+
+# ---------------- 信号与调仓 ----------------
+live:
+  topk: 5                      # 目标持仓数
+  weight_scheme: equal         # 权重: equal等权 / score按打分加权
+  rebalance_freq: weekly       # 调仓频率: daily / weekly
+  holdings_file: data/cache/current_holdings.yaml  # 当前持仓(人工维护)
+  signal_file: data/cache/latest_signal.md         # 最新信号输出
+  dry_run: true                # true=只生成不推送
+
+# ---------------- 通知 ----------------
+notify:
+  enable: false
+  # 企业微信/钉钉 webhook (二选一)
+  webhook_url: ""              # https://qyapi.weixin.qq.com/...
+  webhook_type: wechat         # wechat / dingtalk
+  # 邮件 (SMTP)
+  email_enable: false
+  smtp_host: "smtp.qq.com"
+  smtp_port: 465
+  smtp_user: ""
+  smtp_pass: ""
+  email_to: ""                 # 收件人, 逗号分隔
+
+# ---------------- 调度 ----------------
+schedule:
+  daily_run_time: "16:30"      # 盘后执行时间
+  timezone: "Asia/Shanghai"
