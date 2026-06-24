@@ -69,7 +69,7 @@ def build_ts_dataset(df: pd.DataFrame, horizon: int = HORIZON):
     for f in TS_FEATURES:
         d[f] = d[f].replace([np.inf, -np.inf], np.nan)
         # 用百分位裁剪极端值(仅对有限值)
-        finite = d[f].replace([np.inf, -np.inf], np.nan()).dropna()
+        finite = d[f].replace([np.inf, -np.inf], np.nan).dropna()
         if len(finite) > 10:
             lo, hi = finite.quantile(0.001), finite.quantile(0.999)
             d[f] = d[f].clip(lower=lo, upper=hi)

@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+# 在 Windows 环境构建桌面应用 (Mac 本机无法直接产出 Windows 可执行文件)。
+# 触发: 打 v* 标签自动构建并发 Release; 也可在 Actions 页手动 dispatch。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        # qlib 0.9.7 官方支持到 3.10; 3.11 社区验证可行, 3.12 有 pydantic/dataclass 风险。
+        # 若 CI 安装 qlib 失败, 可改为 '3.9' 与本地开发环境一致。
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # requirements.txt 已含 pyinstaller/platformdirs/pywebview, 此处幂等
+
+      - name: Build with PyInstaller
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pyinstaller build/stock_agent.spec --noconfirm --windowed
+
+      - name: Zip artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/A股量化系统" -DestinationPath stock_agent-windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock_agent-windows
+          path: stock_agent-windows.zip
+          retention-days: 30
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: stock_agent-windows.zip

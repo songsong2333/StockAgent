@@ -30,6 +30,16 @@ qlib:
 # ---------------- 股票池 ----------------
 universe: config/watchlist.yaml   # 选股范围: watchlist文件路径 或 "all"(全市场)
 
+# ---------------- 轮动策略 ----------------
+rotation:
+  universe: config/sector_leaders.yaml   # 轮动候选池(板块龙头)
+  topn: 5                       # 持仓数(板块数)
+  max_per_sector: 1             # 每板块最多选几只(1=纯板块轮动)
+  max_dd_target: 0.15           # 目标最大回撤(用户可调): 系统按此自动定仓位比例
+  freq: 5                       # 调仓频率(交易日)
+  mom_win: 60                   # 动量窗口
+  bias_max: 0.20                # 乖离过滤上限(越低越不追高)
+
 # ---------------- 因子与模型 ----------------
 model:
   handler: alpha158            # 因子集: alpha158 (qlib内置158因子)
