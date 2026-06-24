@@ -3,13 +3,58 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import yaml
 
-# 项目根目录
-PROJECT_ROOT = Path(__file__).resolve().parent
+
+# ============== 路径机制: 源码模式 / 打包(frozen)模式双语义 ==============
+# 打包后代码目录是只读的, config 与数据必须落到用户可写目录。
+def _is_frozen() -> bool:
+    """是否运行在 PyInstaller 打包环境。"""
+    return getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
+
+
+def _resource_root() -> Path:
+    """只读资源根: config 模板等。打包后 = _MEIPASS; 源码 = 项目根。"""
+    if _is_frozen():
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+
+def _data_root() -> Path:
+    """可写、持久化数据根。打包后 = 用户数据目录; 源码 = 项目根(保持兼容)。"""
+    if _is_frozen():
+        from platformdirs import user_data_dir
+        d = Path(user_data_dir("stock_agent", "StockAgent"))
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    return Path(__file__).resolve().parent
+
+
+def resolve_data_path(p: Union[str, Path]) -> Path:
+    """把配置里的相对路径解析为绝对路径, 相对 PROJECT_ROOT。"""
+    pp = Path(p)
+    return pp if pp.is_absolute() else (PROJECT_ROOT / pp)
+
+
+def ensure_user_config() -> None:
+    """首次运行: 从打包模板把 config/*.yaml 拷贝到用户 config 目录(不覆盖已有)。"""
+    cfg_dir = PROJECT_ROOT / "config"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    tmpl_dir = RESOURCE_ROOT / "config_template"
+    if tmpl_dir.exists():
+        for f in tmpl_dir.glob("*.yaml"):
+            if not (cfg_dir / f.name).exists():
+                shutil.copy2(f, cfg_dir / f.name)
+
+
+PROJECT_ROOT = _data_root()          # 写数据 / 读用户配置 -> 业务逻辑统一沿用此名
+RESOURCE_ROOT = _resource_root()     # 读只读模板用
+ensure_user_config()                 # 模块导入时确保配置就位
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 
 # A股代码 -> qlib 代码 (SH/SZ/BJ 前缀)

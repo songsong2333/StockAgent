@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from common import setup_logger, ensure_dir, load_config
+from common import setup_logger, ensure_dir, load_config, resolve_data_path
 
 log = setup_logger("collector.dump")
 
@@ -24,17 +24,12 @@ QLIB_FIELDS = ["open", "high", "low", "close", "volume", "amount", "turnover"]
 
 
 def _abs_path(cfg, key: str) -> Path:
-    p = Path(cfg["qlib"]["provider_uri"])
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parent.parent / p).resolve()
-    return p
+    return resolve_data_path(cfg["qlib"]["provider_uri"]).resolve()
 
 
 def load_all_raw(cfg: dict, codes: Optional[List[str]] = None) -> dict:
     """读取所有股票 parquet, 返回 {qlib_code: DataFrame(date indexed)}。"""
-    raw_dir = Path(cfg["paths"]["raw_dir"])
-    if not raw_dir.is_absolute():
-        raw_dir = (Path(__file__).resolve().parent.parent / raw_dir).resolve()
+    raw_dir = resolve_data_path(cfg["paths"]["raw_dir"]).resolve()
     files = sorted(raw_dir.glob("*.parquet"))
     if codes:
         wanted = {c.upper() for c in codes}

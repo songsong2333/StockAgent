@@ -14,7 +14,7 @@ from qlib.utils import init_instance_by_config
 from qlib.workflow import R
 from qlib.contrib.evaluate import backtest_daily, risk_analysis
 
-from common import load_config, setup_logger
+from common import load_config, setup_logger, resolve_data_path
 from factor.handler import build_dataset_config, build_model_config
 
 log = setup_logger("backtest.runner")
@@ -27,10 +27,7 @@ def init_qlib(cfg: dict):
     global _INITIALIZED
     if _INITIALIZED:
         return
-    qlib_dir = cfg["qlib"]["provider_uri"]
-    p = Path(qlib_dir)
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parent.parent / p).resolve()
+    p = resolve_data_path(cfg["qlib"]["provider_uri"]).resolve()
     if not (p / "calendars").exists():
         raise FileNotFoundError(
             f"qlib 数据未就绪: {p}/calendars 不存在, 请先运行 scripts/init_history.py"

@@ -1,0 +1,83 @@
+# 板块龙头轮动池 v2: 每个细分板块 3 个龙头, 科技/算力加重。
+# 跨期稳定性: 蓝筹(消费/金融/公用/周期)逻辑可复用; 科技仅用AI时代(2024+)数据。
+
+leaders:
+  # ============ 科技/算力 (加重) ============
+  - {code: "300308", name: 中际旭创, sector: 光模块}
+  - {code: "300502", name: 新易盛, sector: 光模块}
+  - {code: "300394", name: 天孚通信, sector: 光模块}
+  - {code: "002371", name: 北方华创, sector: 半导体设备}
+  - {code: "688012", name: 中微公司, sector: 半导体设备}
+  - {code: "688082", name: 盛美上海, sector: 半导体设备}
+  - {code: "603501", name: 韦尔股份, sector: 芯片设计}
+  - {code: "603986", name: 兆易创新, sector: 芯片设计}
+  - {code: "688256", name: 寒武纪, sector: 芯片设计}
+  - {code: "002463", name: 沪电股份, sector: PCB}
+  - {code: "002916", name: 深南电路, sector: PCB}
+  - {code: "300476", name: 胜宏科技, sector: PCB}
+  - {code: "000977", name: 浪潮信息, sector: 服务器}
+  - {code: "601138", name: 工业富联, sector: 服务器}
+  - {code: "603019", name: 中科曙光, sector: 服务器}
+  - {code: "301308", name: 江波龙, sector: 存储}
+  - {code: "300223", name: 北京君正, sector: 存储}
+  - {code: "688525", name: 佰维存储, sector: 存储}
+  - {code: "002475", name: 立讯精密, sector: 消费电子}
+  - {code: "300433", name: 蓝思科技, sector: 消费电子}
+  - {code: "002241", name: 歌尔股份, sector: 消费电子}
+  - {code: "688146", name: 中船特气, sector: 电子材料}
+  - {code: "300054", name: 鼎龙股份, sector: 电子材料}
+  - {code: "002409", name: 雅克科技, sector: 电子材料}
+  # ============ 新能源 ============
+  - {code: "300750", name: 宁德时代, sector: 动力电池}
+  - {code: "300014", name: 亿纬锂能, sector: 动力电池}
+  - {code: "300207", name: 欣旺达, sector: 动力电池}
+  - {code: "601012", name: 隆基绿能, sector: 光伏}
+  - {code: "600438", name: 通威股份, sector: 光伏}
+  - {code: "300274", name: 阳光电源, sector: 光伏}
+  - {code: "002460", name: 赣锋锂业, sector: 锂}
+  - {code: "002466", name: 天齐锂业, sector: 锂}
+  - {code: "002756", name: 永兴材料, sector: 锂}
+  - {code: "002594", name: 比亚迪, sector: 新能源车}
+  - {code: "601633", name: 长城汽车, sector: 新能源车}
+  - {code: "601127", name: 赛力斯, sector: 新能源车}
+  # ============ 消费 (蓝筹, 逻辑跨期稳定) ============
+  - {code: "600519", name: 贵州茅台, sector: 白酒}
+  - {code: "000858", name: 五粮液, sector: 白酒}
+  - {code: "000568", name: 泸州老窖, sector: 白酒}
+  - {code: "603288", name: 海天味业, sector: 食品}
+  - {code: "600887", name: 伊利股份, sector: 食品}
+  - {code: "000333", name: 美的集团, sector: 家电}
+  - {code: "000651", name: 格力电器, sector: 家电}
+  - {code: "600690", name: 海尔智家, sector: 家电}
+  # ============ 金融 (蓝筹) ============
+  - {code: "600036", name: 招商银行, sector: 银行}
+  - {code: "601166", name: 兴业银行, sector: 银行}
+  - {code: "601398", name: 工商银行, sector: 银行}
+  - {code: "601318", name: 中国平安, sector: 保险}
+  - {code: "601628", name: 中国人寿, sector: 保险}
+  - {code: "600030", name: 中信证券, sector: 证券}
+  - {code: "601688", name: 华泰证券, sector: 证券}
+  # ============ 医药 ============
+  - {code: "600276", name: 恒瑞医药, sector: 创新药}
+  - {code: "688235", name: 百济神州, sector: 创新药}
+  - {code: "603259", name: 药明康德, sector: CXO}
+  - {code: "002821", name: 凯莱英, sector: CXO}
+  # ============ 周期/资源 ============
+  - {code: "601899", name: 紫金矿业, sector: 铜}
+  - {code: "603993", name: 洛阳钼业, sector: 铜}
+  - {code: "000630", name: 铜陵有色, sector: 铜}
+  - {code: "600309", name: 万华化学, sector: 化工}
+  - {code: "600426", name: 华鲁恒升, sector: 化工}
+  - {code: "601088", name: 中国神华, sector: 煤炭}
+  - {code: "601225", name: 陕西煤业, sector: 煤炭}
+  - {code: "601857", name: 中国石油, sector: 石油}
+  - {code: "600938", name: 中国海油, sector: 石油}
+  # ============ 公用/防御 (蓝筹) ============
+  - {code: "600900", name: 长江电力, sector: 电力}
+  - {code: "600886", name: 国投电力, sector: 电力}
+  - {code: "600941", name: 中国移动, sector: 运营商}
+  - {code: "601728", name: 中国电信, sector: 运营商}
+  # ============ 军工 / 地产 ============
+  - {code: "600760", name: 中航沈飞, sector: 军工}
+  - {code: "600893", name: 航发动力, sector: 军工}
+  - {code: "600048", name: 保利发展, sector: 地产}

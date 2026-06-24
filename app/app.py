@@ -13,15 +13,20 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# 让 app 能导入项目根目录的模块
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+# 让 app 能导入项目根目录的模块 (源码模式生效; 打包模式模块已内置, 无害)
+_CODE_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_CODE_ROOT))
 
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-from common import load_config, save_config, to_qlib_code, to_raw_code
+from common import (
+    load_config, save_config, to_qlib_code, to_raw_code, PROJECT_ROOT,
+)
+from strategy.rotation import metrics_from_returns
+# 数据/配置路径统一指向: 源码模式=项目根, 打包模式=用户数据目录
+ROOT = PROJECT_ROOT
 
 st.set_page_config(page_title="A股量化交易系统", page_icon="📈", layout="wide")
 
@@ -337,12 +342,85 @@ def page_signals():
             st.warning("请先生成信号")
 
 
+# ============== 页面: 轮动策略 ==============
+def page_rotation():
+    st.title("🔁 轮动策略")
+    st.caption("板块龙头轮动 · 大盘择时 · 追高过滤 · 回撤预算控制")
+    cfg = get_cfg()
+    rc = cfg.get("rotation", {})
+
+    st.subheader("参数调节 (拖动实时看效果)")
+    col = st.columns(3)
+    topn = col[0].slider("持仓板块数 topN", 2, 8, int(rc.get("topn", 5)))
+    target = col[1].slider("🎯 目标最大回撤", 0.05, 0.30, float(rc.get("max_dd_target", 0.15)), 0.01)
+    bias = col[2].slider("乖离上限(越低越不追高)", 0.08, 0.30, float(rc.get("bias_max", 0.20)), 0.01)
+
+    universe = rc.get("universe", "config/sector_leaders.yaml")
+    # 满仓日收益只算一次(缓存), 滑块拖动时即时缩仓重算
+    @st.cache_data(show_spinner="计算满仓回测...", ttl=600)
+    def _full_daily(_topn, _bias, _universe):
+        from strategy.rotation import backtest_rotation
+        bt = backtest_rotation(cfg, topn=_topn, bias_max=_bias, max_per_sector=1, exposure=1.0)
+        return bt["daily_ret"], bt["bench_daily"], bt["dates"]
+
+    daily, bench_daily, dates = _full_daily(topn, bias, universe)
+    full = metrics_from_returns(daily, 1.0)
+    exposure = min(1.0, target / abs(full["max_dd"])) if full["max_dd"] != 0 else 1.0
+    scaled = metrics_from_returns(daily, exposure)
+    bench = metrics_from_returns(bench_daily, 1.0)
+
+    # 指标卡
+    st.subheader("按你的目标回撤 → 自动仓位")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("建议仓位", f"{exposure:.0%}", f"目标回撤 {target:.0%}")
+    c2.metric("实际回撤", f"{scaled['max_dd']:.1%}", f"满仓 {full['max_dd']:.1%}")
+    c3.metric("累计收益", f"{scaled['cum_ret']:+.1%}", f"满仓 {full['cum_ret']:+.1%}")
+    c4.metric("夏普", f"{scaled['sharpe']:.2f}", f"满仓 {full['sharpe']:.2f}")
+
+    # 净值曲线 (满仓 vs 缩仓 vs 基准)
+    st.subheader("净值曲线")
+    fig = go.Figure()
+    dts = pd.to_datetime(dates)
+    fig.add_trace(go.Scatter(x=dts, y=full["curve"], name=f"满仓轮动(回撤{full['max_dd']:.0%})",
+                             line=dict(color="#bbb", dash="dot")))
+    fig.add_trace(go.Scatter(x=dts, y=scaled["curve"], name=f"缩仓 {exposure:.0%}(回撤{scaled['max_dd']:.0%})",
+                             line=dict(color="#e74c3c", width=2)))
+    fig.add_trace(go.Scatter(x=dts, y=bench["curve"], name=f"沪深300(回撤{bench['max_dd']:.0%})",
+                             line=dict(color="#3498db")))
+    fig.update_layout(height=420, hovermode="x unified", template="plotly_white", yaxis_title="净值")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 回撤目标权衡表
+    with st.expander("📊 回撤目标权衡表"):
+        rows = []
+        for t in (0.08, 0.10, 0.12, 0.15, 0.20, 0.25):
+            ex = min(1.0, t / abs(full["max_dd"])) if full["max_dd"] else 1.0
+            m = metrics_from_returns(daily, ex)
+            mark = "👈 当前" if abs(t - target) < 0.005 else ""
+            rows.append({"目标回撤": f"{t:.0%}", "仓位": f"{ex:.0%}",
+                         "实际回撤": f"{m['max_dd']:.1%}", "累计收益": f"{m['cum_ret']:+.1%}",
+                         "夏普": f"{m['sharpe']:.2f}", "": mark})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("仓位越低夏普往往越高 → 满仓偏激进, 适度降杠杆提升风险调整收益。")
+
+    # 当前信号
+    st.subheader("本期轮动信号")
+    if st.button("🔄 生成最新信号", type="primary"):
+        with st.spinner("计算信号..."):
+            from strategy.rotation import rotation_signal, signal_to_markdown
+            st.session_state["rot_sig"] = rotation_signal(cfg, topn=topn, max_per_sector=1)
+    sig = st.session_state.get("rot_sig")
+    if sig:
+        st.markdown(signal_to_markdown(sig))
+
+
 # ============== 主导航 ==============
 PAGES = {
     "📈 概览": page_overview,
     "⚙️ 配置": page_config,
     "🗃️ 数据采集": page_data,
     "📊 回测": page_backtest,
+    "🔁 轮动策略": page_rotation,
     "📡 信号调仓": page_signals,
 }
 

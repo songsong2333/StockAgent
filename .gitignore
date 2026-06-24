@@ -23,3 +23,12 @@ data/cache/
 
 # qlib/mlruns
 mlruns/
+
+# PyInstaller 构建产物 (保留 build/stock_agent.spec 与 .github/)
+dist/
+build/stock_agent/
+build/*.toc
+build/*.pkg
+build/*.pyz
+build/xref-*.html
+build/warn-*.txt
