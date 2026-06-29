@@ -57,9 +57,26 @@ def is_trade_date(date: str) -> bool:
 
 
 def latest_trade_date(today: Optional[str] = None) -> str:
-    """获取 <= today 的最近一个交易日。"""
+    """获取 <= today 的最近一个交易日(含今天, 即便盘中未结束)。"""
     today = today or pd.Timestamp.now().strftime("%Y-%m-%d")
     dates = get_trade_dates(start="2010-01-01", end=today)
     if not dates:
         return today
     return dates[-1]
+
+
+def latest_closed_trade_date(now=None, close_hour: int = 16) -> str:
+    """最近一个"已收盘"交易日: 当前时间 >= close_hour 才算今天收盘, 否则用前一交易日。
+
+    用于龙虎榜/涨停池等"盘后才有"的数据, 避免盘前取到当天空数据。
+    """
+    now = now or pd.Timestamp.now()
+    today = now.strftime("%Y-%m-%d")
+    dates = get_trade_dates(start="2010-01-01", end=today)
+    if not dates:
+        return today
+    # 当天已过收盘点且当天是交易日 -> 用当天; 否则用前一个
+    if now.hour >= close_hour and dates[-1] == today:
+        return dates[-1]
+    # 取倒数第二个(前一交易日); 若没有则退回最后一个
+    return dates[-2] if len(dates) >= 2 else dates[-1]

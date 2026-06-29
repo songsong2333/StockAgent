@@ -61,24 +61,32 @@ def swing_levels(high: np.ndarray, low: np.ndarray, close: np.ndarray,
     return {"resistance": resist[:3], "support": support[:3]}
 
 
-def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
-                    risk_pct: float = 0.02) -> dict:
-    """生成单股一周操作计划。code: 6位代码。"""
+def price_levels(code: str, cfg: dict, capital: float = 1_000_000,
+                 risk_pct: float = 0.02, live_px: float = None) -> dict:
+    """单股技术价位(不含模型, 快): 现价/加仓区间/减仓位/止损/止盈 + 趋势。
+
+    live_px: 传入实时最新价时, 覆盖末根K, 使所有计算(均线/支撑/压力/止损)以实时现价为基准。
+    供持仓页批量算每只持仓的加仓/减仓价位, 不调模型训练。
+    """
     qc = to_qlib_code(code)
     df = load_stock(qc, cfg)
-    close = df["close"].to_numpy(float)
-    high = df["high"].to_numpy(float)
-    low = df["low"].to_numpy(float)
+    close = df["close"].to_numpy(float).copy()
+    high = df["high"].to_numpy(float).copy()
+    low = df["low"].to_numpy(float).copy()
     vol = df["volume"].to_numpy(float) if "volume" in df else None
+    # 用实时价覆盖最后一根 → 所有后续计算以实时现价为基准, 压力位必在现价之上
+    if live_px:
+        lp = float(live_px)
+        close[-1] = lp
+        high[-1] = max(high[-1], lp)
+        low[-1] = min(low[-1], lp)
     last_close = float(close[-1])
     last_date = df["date"].iloc[-1].strftime("%Y-%m-%d")
 
-    # 均线
     def ma(n):
         return float(np.mean(close[-n:])) if len(close) >= n else np.nan
     ma5, ma10, ma20, ma60, ma120, ma250 = ma(5), ma(10), ma(20), ma(60), ma(120), ma(250)
 
-    # ATR(14)
     tr = np.maximum.reduce([
         high[-15:-1] - low[-15:-1],
         np.abs(high[-15:-1] - close[-16:-2]),
@@ -86,31 +94,23 @@ def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
     ])
     atr = float(np.mean(tr))
 
-    # 区间位置
     hi250, lo250 = float(np.max(close[-250:])), float(np.min(close[-250:]))
     pos_high = last_close / hi250 - 1
     range_pos = (last_close - lo250) / (hi250 - lo250)
-    # 动量
     m5 = close[-1] / close[-6] - 1 if len(close) > 6 else np.nan
     m20 = close[-1] / close[-21] - 1 if len(close) > 21 else np.nan
     m60 = close[-1] / close[-61] - 1 if len(close) > 61 else np.nan
-    # 量能
     v20 = float(np.mean(vol[-20:])) if vol is not None else np.nan
     v60 = float(np.mean(vol[-60:])) if vol is not None else np.nan
     vol_ratio = v20 / v60 - 1 if v60 else np.nan
 
-    # 支撑阻力 (近30日, ±25%带内)
     lv = swing_levels(high, low, close, lookback=30, band=0.25)
-
-    # 模型态度
-    try:
-        att = model_attitude(qc, cfg)
-    except Exception as e:
-        log.warning(f"模型打分失败: {e}")
-        att = {"score": np.nan, "rank": None, "total": 17, "pct": None}
-
-    # 趋势 / 状态判断
-    extended = (last_close > ma20 * 1.10) or (m5 > 0.12)   # 急涨偏离
+    # 兜底: 压力位必在现价之上, 支撑位必在现价之下(突破无近端高点时给百分比位)
+    if not lv["resistance"]:
+        lv["resistance"] = [round(last_close * 1.05, 2), round(last_close * 1.12, 2)]
+    if not lv["support"]:
+        lv["support"] = [round(last_close * 0.95, 2)]
+    extended = (last_close > ma20 * 1.10) or (m5 > 0.12)
     if extended:
         trend = f"短线急涨偏离 (5日{m5:+.0%}, 高于MA20 {(last_close/ma20-1):+.0%})"
     elif ma5 > ma10 > ma20 > ma60:
@@ -120,11 +120,7 @@ def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
     else:
         trend = "震荡/纠缠"
 
-    # 关键位
     near_support = lv["support"][0] if lv["support"] else ma20
-    near_resist = lv["resistance"][0] if lv["resistance"] else last_close * 1.08
-
-    # 入场区间: 急涨偏离时不追高, 等回踩MA10/MA20; 否则在支撑~现价间
     if extended:
         entry_low = min(ma10, ma20) * 0.99
         entry_high = max(ma10, ma20) * 1.01
@@ -132,23 +128,41 @@ def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
     else:
         entry_low = min(near_support, ma20) * 0.995
         entry_high = last_close * 1.01
-        entry_hint = "回踩支撑/MA20低吸, 或放量突破近高追涨"
-    # 止损: 入场下方 1.5×ATR
+        entry_hint = "回踩支撑/MA20低吸"
     stop = entry_low - 1.5 * atr
-    # 目标: 阻力位升序 (T1 < T2)
     resists = lv["resistance"] if lv["resistance"] else [last_close * 1.07, last_close * 1.15]
     t1 = resists[0]
     t2 = resists[1] if len(resists) > 1 else resists[0] * 1.10
-    if t2 <= t1:   # 保证 T2 > T1
+    if t2 <= t1:
         t2 = t1 * 1.10
-    # 仓位: 风险定价
     risk_amt = capital * risk_pct
     entry_ref = (entry_low + entry_high) / 2
     per_share_risk = entry_ref - stop
     shares = int(risk_amt / per_share_risk / 100) * 100 if per_share_risk > 0 else 0
-    pos_value = shares * entry_ref
 
-    # 模型态度文字
+    return {
+        "code": code, "qc": qc, "last_date": last_date, "last_close": last_close,
+        "ma": {"MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60, "MA120": ma120, "MA250": ma250},
+        "atr": atr, "hi250": hi250, "lo250": lo250, "pos_high": pos_high, "range_pos": range_pos,
+        "mom": {"m5": m5, "m20": m20, "m60": m60}, "vol_ratio": vol_ratio,
+        "support": lv["support"], "resistance": lv["resistance"],
+        "trend": trend, "extended": extended,
+        "entry_low": entry_low, "entry_high": entry_high, "entry_hint": entry_hint,
+        "stop": stop, "t1": t1, "t2": t2,
+        "shares": shares, "pos_value": shares * entry_ref, "risk_amt": risk_amt, "capital": capital,
+    }
+
+
+def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
+                    risk_pct: float = 0.02) -> dict:
+    """生成单股一周操作计划(技术价位 + 模型态度)。code: 6位代码。"""
+    p = price_levels(code, cfg, capital, risk_pct)
+    qc = p["qc"]
+    try:
+        att = model_attitude(qc, cfg)
+    except Exception as e:
+        log.warning(f"模型打分失败: {e}")
+        att = {"score": np.nan, "rank": None, "total": 17, "pct": None}
     if att["rank"] is not None:
         if att["pct"] <= 0.3:
             att_txt = f"看好 (17只中排第{att['rank']})"
@@ -158,18 +172,9 @@ def build_week_plan(code: str, cfg: dict, capital: float = 1_000_000,
             att_txt = f"暂不看好 (排第{att['rank']}/17, 打分偏低)"
     else:
         att_txt = "无打分"
-
-    return {
-        "code": code, "qc": qc, "last_date": last_date, "last_close": last_close,
-        "ma": {"MA5": ma5, "MA10": ma10, "MA20": ma20, "MA60": ma60, "MA120": ma120, "MA250": ma250},
-        "atr": atr, "hi250": hi250, "lo250": lo250, "pos_high": pos_high, "range_pos": range_pos,
-        "mom": {"m5": m5, "m20": m20, "m60": m60}, "vol_ratio": vol_ratio,
-        "support": lv["support"], "resistance": lv["resistance"],
-        "trend": trend, "extended": extended, "attitude": att_txt, "att": att,
-        "entry_low": entry_low, "entry_high": entry_high, "entry_hint": entry_hint,
-        "stop": stop, "t1": t1, "t2": t2,
-        "shares": shares, "pos_value": pos_value, "risk_amt": risk_amt, "capital": capital,
-    }
+    p["attitude"] = att_txt
+    p["att"] = att
+    return p
 
 
 def to_markdown(p: dict, week: str) -> str:

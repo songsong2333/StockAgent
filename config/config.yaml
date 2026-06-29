@@ -96,3 +96,9 @@ notify:
 schedule:
   daily_run_time: "16:30"      # 盘后执行时间
   timezone: "Asia/Shanghai"
+
+# ---------------- 许可证 / 付费门控 ----------------
+license:
+  secret_env: STOCK_AGENT_SECRET   # 激活码签名密钥的环境变量名(生产务必设置)
+  # 免费功能: 情绪温度计/打板梯队/强势股/题材热度/龙虎榜/轮动/回测
+  # Pro 付费: 盘中盯盘预警 / 自研ML模型训练

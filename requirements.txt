@@ -9,6 +9,7 @@ pyyaml>=6.0
 requests>=2.28.0         # webhook 通知
 schedule>=1.2.0          # 备用调度
 tqdm>=4.64.0             # 进度条
+pypinyin>=0.50.0         # 股票名拼音首字母搜索
 streamlit==1.50.0        # Mac 应用 GUI (锁版本: desktop_app 依赖 bootstrap.run 内部 API)
 plotly>=5.14.0           # 交互式图表
 pytest>=7.2.0            # 测试

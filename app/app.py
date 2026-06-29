@@ -50,6 +50,364 @@ def qlib_ready(cfg) -> bool:
     return (d / "calendars").exists()
 
 
+@st.cache_data(show_spinner=False, ttl=600)
+def _names() -> dict:
+    """{6位代码: 名称}。本地优先(自选/龙头池/持仓 yaml, 无网络依赖) + akshare全量兜底。"""
+    nm = {}
+    # 1) 本地 yaml(可靠) —— 用户关注的股都在这几个文件里
+    for f in ("config/watchlist.yaml", "config/sector_leaders.yaml"):
+        try:
+            for s in _load_yaml_stocks(f):
+                if s.get("code"):
+                    nm[str(s["code"])] = s.get("name", "")
+        except Exception:
+            pass
+    # 2) 当前持仓
+    try:
+        cfg = load_config()
+        from live.portfolio_builder import load_current_holdings
+        for qc, h in (load_current_holdings(cfg["live"]["holdings_file"]).get("holdings", {}) or {}).items():
+            nm[qc[2:]] = h.get("name", "")
+    except Exception:
+        pass
+    # 3) akshare 全量(尽力而为, 失败不影响本地)
+    try:
+        from collector.stock_pool import get_all_a_shares
+        df = get_all_a_shares()
+        for c, n in zip(df["code"], df["name"]):
+            nm.setdefault(str(c), str(n))
+    except Exception:
+        pass
+    return nm
+
+
+@st.cache_data(show_spinner="建立搜索索引...", ttl=600)
+def _search_index() -> pd.DataFrame:
+    """全A股搜索索引: [code, name, py(拼音首字母)]。供按代码/名称/拼音搜索。"""
+    from pypinyin import lazy_pinyin, Style
+    nm = _names()
+    codes, names, pys = [], [], []
+    for code, name in nm.items():
+        try:
+            py = "".join(lazy_pinyin(str(name), style=Style.FIRST_LETTER, errors="ignore"))
+        except Exception:
+            py = ""
+        codes.append(code); names.append(str(name)); pys.append(py.lower())
+    return pd.DataFrame({"code": codes, "name": names, "py": pys})
+
+
+def _safe_table(df, empty_msg: str = "暂无数据"):
+    """安全渲染表格: 空或异常时显示提示, 而不是抛堆栈。"""
+    try:
+        if df is None or (hasattr(df, "empty") and df.empty) or (hasattr(df, "shape") and df.shape[0] == 0):
+            st.caption(empty_msg)
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.caption(f"{empty_msg}（渲染异常: {e}）")
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _live_closes(codes: list) -> dict:
+    """取最新收盘价(新浪源, 盘外/周末也返回最近交易日收盘)。{6位代码: 价格}。失败返回{}。"""
+    import pandas as _pd
+    from collector.daily_collector import fetch_daily
+    end = _pd.Timestamp.now().strftime("%Y-%m-%d")
+    start = (_pd.Timestamp.now() - _pd.Timedelta(days=12)).strftime("%Y-%m-%d")
+    out = {}
+    for c in codes:
+        try:
+            df = fetch_daily(c, start, end, "qfq")
+            if df is not None and not df.empty:
+                out[str(c).zfill(6)] = float(df.iloc[-1]["close"])
+        except Exception:
+            pass
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def _analyst_info(code: str) -> dict:
+    """取个股最新研报: 评级/机构/日期/盈利预测(EPS,PE)。失败返回{}。"""
+    import akshare as ak
+    df = ak.stock_research_report_em(symbol=str(code).zfill(6))
+    if df is None or df.empty:
+        return {}
+    r = df.iloc[0]
+    eps = r.get("2026-盈利预测-收益")
+    pe = r.get("2026-盈利预测-市盈率")
+    return {
+        "rating": r.get("东财评级") or r.get("评级") or "",
+        "org": r.get("机构") or "",
+        "date": str(r.get("日期", ""))[:10],
+        "eps": float(eps) if pd.notna(eps) else None,
+        "pe": float(pe) if pd.notna(pe) else None,
+        "n_reports": int(r.get("近一月个股研报数", 0) or 0),
+    }
+
+
+def _stock_picker(key: str, exclude: set = None):
+    """搜索添加股票组件。返回 (code, name) 或 None。
+
+    支持按 6位代码 / 中文名 / 拼音首字母 模糊搜索(如 300308 / 中际 / zjxc)。
+    用于把股票加到表格里(不用手敲代码)。任何异常都不抛, 保证页面不崩。
+    """
+    exclude = exclude or set()
+    st.caption("🔍 搜索添加：输代码/名称/拼音(如 300308 / 中际 / zjxc)→下拉选→添加到表格（也可直接在表格里输名称，保存时自动带代码）")
+    try:
+        idx = _search_index()
+    except Exception:
+        idx = pd.DataFrame(columns=["code", "name", "py"])
+    # ⚠️ Streamlit 不允许在 widget 创建后改它的 key; 用"待清除"标记, 在创建前清空
+    clear_flag = f"_clr_pick_{key}"
+    if st.session_state.get(clear_flag):
+        st.session_state[f"kh_{key}"] = ""
+        st.session_state[f"sel_{key}"] = ""
+        st.session_state[clear_flag] = False
+    kw = st.text_input("搜索", key=f"kh_{key}",
+                       placeholder="代码 / 名称 / 拼音", label_visibility="collapsed")
+    if not (kw and kw.strip()):
+        return None
+    k = kw.strip().lower()
+    try:
+        sub = idx[(idx["code"].astype(str).str.startswith(k)) |
+                  (idx["name"].astype(str).str.contains(k, na=False, regex=False)) |
+                  (idx["py"].astype(str).str.contains(k, na=False, regex=False))]
+        sub = sub[~sub["code"].isin(exclude)].head(20)
+    except Exception:
+        sub = pd.DataFrame()
+    if sub.empty:
+        st.caption("无匹配，换个关键词试试（或直接在表格里填名称）")
+        return None
+    opts = [f"{r.code}　{r.name}" for r in sub.itertuples(index=False)]
+    label = f"匹配 {len(sub)} 只" + ("（更多请细化关键词）" if len(sub) >= 20 else "")
+    chosen = st.selectbox(label, options=[""] + opts, key=f"sel_{key}")
+    col1, _ = st.columns([1, 3])
+    if chosen and col1.button("➕ 添加到表格", key=f"add_{key}", type="primary"):
+        code = chosen.split()[0]
+        name = idx.loc[idx["code"] == code, "name"].iloc[0]
+        st.session_state[clear_flag] = True   # 下次运行前清空搜索框
+        return (code, name)
+    return None
+
+
+# ============== 页面: 持仓与推荐 ==============
+def page_holdings():
+    import yaml
+    st.title("💼 持仓与推荐")
+    st.caption("当前持仓 · 模型推荐 · 调仓缺口 · 操作单(下单价位) · 推送")
+    cfg = get_cfg()
+    nm = _names()
+    holdings_path = ROOT / cfg["live"]["holdings_file"]
+    holdings_path.parent.mkdir(parents=True, exist_ok=True)
+    if not holdings_path.exists():
+        holdings_path.write_text("cash: 0\nholdings: {}\n", encoding="utf-8")
+    from live.portfolio_builder import load_current_holdings, build_rebalance
+    from live.order_sheet import get_latest_prices, build_order_sheet
+
+    current = load_current_holdings(cfg["live"]["holdings_file"])
+    holdings = current.get("holdings", {}) or {}
+    cash = float(current.get("cash", 0) or 0)
+
+    # ---------- ① 持仓编辑(表格式, 不暴露YAML) ----------
+    st.subheader("📌 我的持仓")
+    st.caption("表格里改/加/删行：**代码或名称填一个即可**（保存时自动互查），再填股数和成本→点保存。底部 ＋ 可加行。")
+    edit_rows = [{"代码": qc[2:], "名称": nm.get(qc[2:], h.get("name", "-")),
+                  "持仓股数": int(h.get("shares", 0)), "成本价": float(h.get("cost", 0) or 0)}
+                 for qc, h in holdings.items()]
+    edit_df = pd.DataFrame(edit_rows, columns=["代码", "名称", "持仓股数", "成本价"])
+    if "hold_df" not in st.session_state:
+        st.session_state["hold_df"] = edit_df
+    edited = st.data_editor(
+        st.session_state["hold_df"], num_rows="dynamic", use_container_width=True, key="holdings_editor",
+        column_config={"代码": st.column_config.TextColumn(width="small"),
+                       "名称": st.column_config.TextColumn(width="medium"),
+                       "持仓股数": st.column_config.NumberColumn(min_value=0, step=100),
+                       "成本价": st.column_config.NumberColumn(min_value=0.0, step=0.001, format="%.3f")})
+    st.session_state["hold_df"] = edited  # 同步编辑
+
+    cash_in = st.number_input("现金(元)", value=cash, step=10000.0, key="cash_in")
+    if st.button("💾 保存持仓", type="primary", key="save_holdings"):
+        name_to_code = {v: k for k, v in nm.items()} if nm else {}  # 名称->代码 反查
+        new_hold, seen, unresolved = {}, set(), []
+        for _, r in edited.iterrows():
+            raw_code = str(r["代码"]).strip()
+            name = str(r["名称"]).strip()
+            code = None
+            if raw_code and raw_code.isdigit():            # 直接填了代码
+                code = raw_code.zfill(6)
+            elif name and name in name_to_code:            # 只填了名称 → 反查代码
+                code = name_to_code[name]
+            elif raw_code and raw_code in name_to_code:    # 名称误填到代码列
+                code = name_to_code[raw_code]
+            if not code:
+                if name or raw_code:
+                    unresolved.append(name or raw_code)    # 填了内容但识别不出
+                continue
+            if not (code.isdigit() and len(code) == 6) or code in seen:
+                continue
+            seen.add(code)
+            new_hold[to_qlib_code(code)] = {
+                "shares": int(r["持仓股数"] or 0),
+                "cost": float(r["成本价"] or 0),
+                "name": name or nm.get(code, "")}
+        if unresolved:
+            st.warning(f"以下未识别出代码（检查名称/代码是否正确）: {unresolved}")
+        holdings_path.write_text(
+            yaml.safe_dump({"cash": float(cash_in), "holdings": new_hold},
+                           allow_unicode=True, sort_keys=False), encoding="utf-8")
+        # 用解析后的结果刷新表格(名称→代码 已带出)
+        st.session_state["hold_df"] = pd.DataFrame([
+            {"代码": qc[2:], "名称": h.get("name", "") or nm.get(qc[2:], ""),
+             "持仓股数": int(h.get("shares", 0)), "成本价": float(h.get("cost", 0) or 0)}
+            for qc, h in new_hold.items()])
+        st.success(f"已保存 {len(new_hold)} 只持仓 ✅"); st.rerun()
+
+    # ---------- ② 持仓调仓建议: 现价/市值/浮盈 + 加仓/减仓/止损价位 ----------
+    if holdings:
+        st.divider()
+        st.subheader("📐 持仓调仓建议（现价/浮盈 + 加仓 / 减仓价位）")
+        st.caption("基于每只持仓的技术面(均线/支撑/阻力/ATR)：回踩**加仓区间**低吸，到**减仓位**分批止盈，破**止损**离场。"
+                   "想看「模型建议买哪些新票」请去 🧪 自研模型 → 推荐持仓。")
+        from live.stock_plan import price_levels
+        # 先确保每只持仓有足够日线(price_levels 需 ~260 日历史), 缺的自动补采(新浪源)
+        import pandas as _pd
+        from collector.daily_collector import update_one
+        raw_dir = ROOT / cfg["paths"]["raw_dir"]
+        ensure_start = (_pd.Timestamp.now() - _pd.DateOffset(years=2)).strftime("%Y-%m-%d")
+        ensure_end = _pd.Timestamp.now().strftime("%Y-%m-%d")
+        need = []
+        for qc in holdings:
+            p = raw_dir / f"{qc}.parquet"
+            try:
+                short = (not p.exists()) or (len(_pd.read_parquet(p)) < 260)
+            except Exception:
+                short = True
+            if short:
+                need.append(qc)
+        if need:
+            with st.spinner(f"首次分析，补采 {len(need)} 只持仓的日线（约 {len(need)*1}0 秒）..."):
+                for qc in need:
+                    try:
+                        update_one(qc, str(raw_dir), ensure_start, ensure_end,
+                                   cfg["collector"].get("adjust", "qfq"),
+                                   cfg["collector"]["max_retries"], 0.4)
+                    except Exception:
+                        pass
+        # 实时最新价(周末/盘后也是最新收盘价), 取不到则回退 parquet 末值
+        with st.spinner("读取实时行情..."):
+            try:
+                live_px = _live_closes([qc[2:] for qc in holdings])
+            except Exception:
+                live_px = {}
+        advice_rows, missing, total_mv = [], [], 0.0
+        for qc, h in holdings.items():
+            code = qc[2:]
+            shares = int(h.get("shares", 0))
+            cost = float(h.get("cost", 0) or 0)
+            try:
+                p = price_levels(code, cfg, live_px=live_px.get(code))
+            except Exception:
+                missing.append(code)
+                continue
+            px = live_px.get(code) or p["last_close"]   # 优先实时价
+            mv = shares * px
+            total_mv += mv
+            pnl = (px / cost - 1) if cost else None
+            # 机构研报(尽力而为)
+            try:
+                ai = _analyst_info(code)
+            except Exception:
+                ai = {}
+            sup = p["support"][0] if p["support"] else None
+            res = p["resistance"]
+            advice_rows.append({
+                "代码": code, "名称": nm.get(code, h.get("name", "-")), "持仓": shares,
+                "成本": round(cost, 3), "现价": round(px, 2), "市值": round(mv),
+                "浮盈": f"{pnl:+.1%}" if pnl else "-",
+                "趋势": p["trend"],
+                "距250日高": f"{p['pos_high']:+.1%}",
+                "支撑位": round(sup, 2) if sup else "-",
+                "加仓区间": f"{p['entry_low']:.2f}~{p['entry_high']:.2f}",
+                "压力位1": round(res[0], 2) if len(res) > 0 else "-",
+                "压力位2": round(res[1], 2) if len(res) > 1 else "-",
+                "止损": round(p["stop"], 2),
+                "机构评级": f"{ai.get('rating','')}{('·'+ai['org']) if ai.get('org') else ''}" or "-",
+                "研报估值(26E)": f"EPS {ai['eps']:.2f} / PE {ai['pe']:.0f}" if ai.get("eps") and ai.get("pe") else "-",
+            })
+        if advice_rows:
+            st.dataframe(pd.DataFrame(advice_rows), use_container_width=True, hide_index=True)
+            st.caption(f"股票市值 ¥{total_mv:,.0f} · 现金 ¥{cash:,.0f} · 合计 ¥{total_mv+cash:,.0f}。"
+                       "现价=实时最新价；加仓/减仓/止损 基于历史技术面(数据若旧请去「数据采集」更新)。")
+            if missing:
+                st.caption(f"⚠️ 这些持仓没算出价位(需先采集日线): {missing}")
+        else:
+            st.info("暂无可分析的持仓——先到「🧪 自研模型 → 数据采集」把这些股的日线采下来。")
+
+        # 推送调仓建议
+        if advice_rows and st.button("📨 推送调仓建议到手机", key="push_advice"):
+            from live.notify import notify
+            md = pd.DataFrame(advice_rows).to_markdown(index=False)
+            ok = notify(cfg, f"📐 持仓调仓建议\n\n{md}", subject="A股持仓调仓建议")
+            st.success("已推送" if ok else "推送未成功（检查 notify 设置）")
+
+
+# ============== 页面: 自选股 ==============
+def page_watchlist():
+    import yaml
+    st.title("⭐ 自选股")
+    st.caption("你关注的股票池，驱动模型选股/回测/推荐/盯盘。表格内直接改/加/删，代码或名称填一个即可（保存时自动互查）。")
+    nm = _names()
+    path = ROOT / "config" / "watchlist.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("stocks: []\n", encoding="utf-8")
+    stocks = _load_yaml_stocks("config/watchlist.yaml")
+    edit_df = pd.DataFrame([{"代码": s.get("code", ""), "名称": s.get("name", "")} for s in stocks],
+                           columns=["代码", "名称"])
+    if "wl_df" not in st.session_state:
+        st.session_state["wl_df"] = edit_df
+    edited = st.data_editor(
+        st.session_state["wl_df"], num_rows="dynamic", use_container_width=True,
+        key="wl_editor", hide_index=True,
+        column_config={"代码": st.column_config.TextColumn(width="small", help="6位代码或名称"),
+                       "名称": st.column_config.TextColumn(width="large", help="留空保存时自动带出")})
+    st.session_state["wl_df"] = edited  # 同步编辑
+
+    if st.button("💾 保存自选", type="primary", key="save_watchlist"):
+        name_to_code = {v: k for k, v in nm.items()} if nm else {}
+        new, seen, unresolved = [], set(), []
+        for _, r in edited.iterrows():
+            raw = str(r["代码"]).strip()
+            name = str(r["名称"]).strip()
+            if name in ("", "nan"):
+                name = ""
+            code = None
+            if raw and raw.isdigit():
+                code = raw.zfill(6)
+            elif name and name in name_to_code:
+                code = name_to_code[name]
+            elif raw and raw in name_to_code:
+                code = name_to_code[raw]
+            if not code:
+                if name or (raw and raw != "nan"):
+                    unresolved.append(name or raw)
+                continue
+            if not (code.isdigit() and len(code) == 6) or code in seen:
+                continue
+            seen.add(code)
+            new.append({"code": code, "name": name or nm.get(code, "")})
+        if unresolved:
+            st.warning(f"未识别出代码(检查名称/代码): {unresolved}")
+        path.write_text(yaml.safe_dump({"stocks": new}, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        st.session_state["wl_df"] = pd.DataFrame(
+            [{"代码": s["code"], "名称": s["name"]} for s in new], columns=["代码", "名称"])
+        st.success(f"已保存 {len(new)} 只自选 ✅")
+        st.rerun()
+
+    st.caption("改完自选 → 去「🧪 自研模型 → 数据采集」点增量更新 → 再到「💼 持仓与推荐」重新生成推荐。")
+
+
+
 # ============== 页面: 概览 ==============
 def page_overview():
     st.title("📈 A股量化交易系统")
@@ -61,6 +419,17 @@ def page_overview():
     c2.metric("qlib数据就绪", "✅" if qlib_ready(cfg) else "❌")
     c3.metric("目标持仓数", cfg["backtest"]["topk"])
     c4.metric("调仓方式", "信号提醒")
+
+    # 持仓与推荐速览
+    try:
+        from live.portfolio_builder import load_current_holdings
+        cur = load_current_holdings(cfg["live"]["holdings_file"])
+        n_hold = len(cur.get("holdings", {}) or {})
+    except Exception:
+        n_hold = 0
+    target_csv = ROOT / cfg["paths"]["cache_dir"] / "target_portfolio.csv"
+    st.info(f"📌 当前持仓 **{n_hold}** 只 · 🎯 推荐就绪: **{'是' if target_csv.exists() else '否(去「💼持仓与推荐」生成)'}**  "
+            f"→ 详细看左侧「**💼 持仓与推荐**」页")
 
     st.divider()
     st.subheader("系统状态")
@@ -148,56 +517,105 @@ def page_config():
 
 
 # ============== 页面: 数据采集 ==============
+def _load_yaml_stocks(path: str) -> list:
+    """读 watchlist/sector_leaders 的 stocks/leaders 列表。返回 [{code,name,...}]。"""
+    import yaml
+    p = ROOT / path
+    if not p.exists():
+        return []
+    with open(p, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data.get("leaders") or data.get("stocks") or []
+
+
 def page_data():
     st.title("🗃️ 数据采集")
     cfg = get_cfg()
+    nm = _names()
 
-    st.subheader("股票池")
-    if st.button("刷新股票池"):
-        st.session_state["pool"] = None
-    if "pool" not in st.session_state or not isinstance(st.session_state.get("pool"), pd.DataFrame):
-        with st.spinner("获取股票池..."):
-            from collector.stock_pool import get_stock_pool
-            try:
-                st.session_state["pool"] = get_stock_pool(cfg)
-            except Exception as e:
-                st.error(f"获取股票池失败: {e}")
-                st.session_state["pool"] = None
-    pool = st.session_state.get("pool")
-    if isinstance(pool, pd.DataFrame):
-        st.write(f"共 {len(pool)} 只股票")
-        st.dataframe(pool, use_container_width=True, height=300)
+    wl = _load_yaml_stocks("config/watchlist.yaml")
+    ld = _load_yaml_stocks("config/sector_leaders.yaml")
+    wl_codes = [to_qlib_code(s["code"]) for s in wl]
+    ld_codes = [to_qlib_code(s["code"]) for s in ld]
+
+    st.subheader("采集目标（只采你关注的，不拉全市场）")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("⭐ 自选股", f"{len(wl_codes)} 只")
+    c2.metric("🔁 轮动候选池", f"{len(ld_codes)} 只")
+    c3.metric("📈 沪深300基准", "1")
+    with st.expander(f"⭐ 自选股 ({len(wl_codes)})"):
+        st.dataframe(pd.DataFrame([{"代码": s["code"], "名称": s["name"]} for s in wl]),
+                     use_container_width=True, hide_index=True)
+    with st.expander(f"🔁 轮动候选池 ({len(ld_codes)})"):
+        st.dataframe(pd.DataFrame([{"代码": s["code"], "名称": s["name"], "板块": s.get("sector", "")} for s in ld]),
+                     use_container_width=True, hide_index=True)
+
+    target = st.radio("采集范围", ["自选+轮动池+基准（推荐）", "仅自选+基准", "仅轮动池+基准"], horizontal=True, key="collect_scope")
+    pick = {"自选+轮动池+基准（推荐）": wl_codes + ld_codes,
+            "仅自选+基准": wl_codes,
+            "仅轮动池+基准": ld_codes}[target]
 
     st.divider()
-    st.subheader("采集历史数据")
-    col = st.columns(3)
-    years = col[0].number_input("年数", 1, 20, 5)
-    symbols = col[1].text_input("指定代码(逗号分隔, 留空=全市场)", "")
-    skip_dump = col[2].checkbox("跳过dump", value=False)
+    mode = st.radio("采集模式", ["增量更新（补到最新，快）", "回填历史（指定年数）"], horizontal=True, key="collect_mode")
+    do_dump = True
+    if mode.startswith("增量"):
+        years = None
+    else:
+        years = st.number_input("回填年数", 1, 10, 2)
+        do_dump = st.checkbox("采集后转为 qlib bin", value=True)
 
     if st.button("🚀 开始采集", type="primary"):
-        from collector.daily_collector import update_all, update_one
+        from collector.daily_collector import update_one
+        from collector.index_collector import update_benchmark_indices
         from collector.dump_to_qlib import dump
+        import time as _t
         end = pd.Timestamp.now().strftime("%Y-%m-%d")
-        start = (pd.Timestamp.now() - pd.DateOffset(years=int(years))).strftime("%Y-%m-%d")
-        cfg["collector"]["start_date"] = start
+        if years:
+            start = (pd.Timestamp.now() - pd.DateOffset(years=int(years))).strftime("%Y-%m-%d")
+            cfg["collector"]["start_date"] = start
+        else:
+            start = cfg["collector"].get("start_date", "2024-07-01")
+        bench = cfg["backtest"].get("benchmark", "SH000300")
+        progress = st.progress(0.0, text="准备采集...")
+        ok = 0
+        # 基准
+        update_benchmark_indices(cfg["paths"]["raw_dir"], start, end, [bench])
+        all_codes = pick
+        for i, c in enumerate(all_codes):
+            try:
+                if update_one(c, cfg["paths"]["raw_dir"], start, end,
+                              cfg["collector"].get("adjust", "qfq"),
+                              cfg["collector"]["max_retries"], cfg["collector"]["request_sleep"]):
+                    ok += 1
+            except Exception as e:
+                st.warning(f"{c} 失败: {e}")
+            progress.progress((i + 1) / len(all_codes), text=f"采集 {c} ({i+1}/{len(all_codes)})")
+        if do_dump:
+            with st.spinner("转换为 qlib bin..."):
+                dump(cfg)
+        st.success(f"采集完成: {ok}/{len(all_codes)} 只成功 ✅")
+        st.rerun()
 
-        if symbols.strip():
-            codes = [to_qlib_code(s.strip()) for s in symbols.split(",") if s.strip()]
-            with st.spinner(f"采集 {len(codes)} 只股票..."):
-                for c in codes:
+    st.divider()
+    with st.expander("⚙️ 高级：指定代码 / 全市场（慎用）"):
+        st.caption("指定代码（逗号分隔）或全市场（5000+只，耗时数小时，一般用不到）。")
+        syms = st.text_input("指定代码", "", key="adv_syms")
+        full = st.checkbox("全市场（极慢，仅在确有必要时勾选）")
+        if st.button("按高级选项采集"):
+            from collector.daily_collector import update_all, update_one
+            from collector.dump_to_qlib import dump
+            end = pd.Timestamp.now().strftime("%Y-%m-%d")
+            start = cfg["collector"].get("start_date", "2024-07-01")
+            if full:
+                with st.spinner("采集全市场（数小时）..."):
+                    update_all(cfg, end=end)
+            elif syms.strip():
+                for c in [to_qlib_code(s.strip()) for s in syms.split(",") if s.strip()]:
                     update_one(c, cfg["paths"]["raw_dir"], start, end,
                                cfg["collector"].get("adjust", "qfq"),
                                cfg["collector"]["max_retries"], cfg["collector"]["request_sleep"])
-        else:
-            with st.spinner("采集全市场 (可能需要数小时, 建议后台运行 scripts/init_history.py)..."):
-                update_all(cfg, end=end)
-
-        if not skip_dump:
-            with st.spinner("转换为 qlib bin 格式..."):
-                dump(cfg, codes=[to_qlib_code(s.strip()) for s in symbols.split(",") if s.strip()] if symbols.strip() else None)
-        st.success("采集完成 ✅")
-        st.rerun()
+            dump(cfg)
+            st.success("完成 ✅"); st.rerun()
 
     st.divider()
     st.subheader("数据状态")
@@ -211,7 +629,7 @@ def page_backtest():
     cfg = get_cfg()
 
     if not qlib_ready(cfg):
-        st.warning("qlib 数据未就绪, 请先在「数据采集」页采集并 dump 数据。")
+        st.warning("qlib 数据未就绪, 请先在「🧪 自研模型 → 数据采集」采集并 dump 数据。")
         return
 
     st.write(f"训练: {cfg['model']['train_start']} ~ {cfg['model']['train_end']} | "
@@ -260,86 +678,6 @@ def page_backtest():
                 fig.add_trace(go.Scatter(x=r.index, y=bench, name="沪深300", line=dict(color="#3498db")))
             fig.update_layout(height=450, hovermode="x unified", template="plotly_white")
             st.plotly_chart(fig, use_container_width=True)
-
-
-# ============== 页面: 信号调仓 ==============
-def page_signals():
-    st.title("📡 信号调仓")
-    cfg = get_cfg()
-
-    st.subheader("当前持仓")
-    holdings_path = ROOT / cfg["live"]["holdings_file"]
-    holdings_path.parent.mkdir(parents=True, exist_ok=True)
-    if not holdings_path.exists():
-        import yaml
-        holdings_path.write_text("cash: 10000000\nholdings: {}\n", encoding="utf-8")
-    holdings_text = st.text_area("编辑当前持仓 (YAML)", holdings_path.read_text(encoding="utf-8"), height=150)
-    if st.button("💾 保存持仓"):
-        holdings_path.write_text(holdings_text, encoding="utf-8")
-        st.success("持仓已保存")
-
-    st.divider()
-    st.subheader("生成目标持仓与调仓清单")
-    total_capital = st.number_input("总资金(元)", value=10_000_000, step=100_000)
-    if st.button("🎯 生成信号", type="primary"):
-        if not qlib_ready(cfg):
-            st.warning("qlib 数据未就绪, 请先采集数据。")
-            return
-        with st.spinner("跑模型打分生成目标持仓..."):
-            try:
-                from live.signal_generator import generate_target_portfolio, save_portfolio
-                from live.portfolio_builder import load_current_holdings, build_rebalance, to_markdown
-                from live.order_sheet import get_latest_prices, build_order_sheet, to_markdown as order_md
-                target = generate_target_portfolio(cfg)
-                save_portfolio(target, cfg)
-                st.session_state["target"] = target
-
-                current = load_current_holdings(cfg["live"]["holdings_file"])
-                orders, summary = build_rebalance(target, current, total_capital)
-                md = to_markdown(orders, summary)
-                (ROOT / cfg["paths"]["cache_dir"]).mkdir(parents=True, exist_ok=True)
-                (ROOT / cfg["paths"]["cache_dir"] / "latest_signal.md").write_text(md, encoding="utf-8")
-                st.session_state["orders"] = orders
-                st.session_state["rebal_md"] = md
-
-                # 操作单 (含买卖价/数量/止损/止盈)
-                prices = get_latest_prices(target["qlib_code"].tolist(), cfg)
-                sheet = build_order_sheet(target, current, total_capital, prices)
-                sheet_md = order_md(sheet, pd.Timestamp.now().strftime("%Y-%m-%d"), total_capital)
-                (ROOT / cfg["paths"]["cache_dir"] / "latest_order_sheet.md").write_text(sheet_md, encoding="utf-8")
-                st.session_state["order_sheet"] = sheet
-                st.session_state["order_sheet_md"] = sheet_md
-                st.success("信号生成完成 ✅")
-            except Exception as e:
-                st.error(f"生成失败: {e}")
-
-    target = st.session_state.get("target")
-    if target is not None:
-        st.subheader("目标持仓")
-        st.dataframe(target, use_container_width=True)
-
-    orders = st.session_state.get("orders")
-    if orders is not None:
-        st.subheader("调仓清单")
-        st.dataframe(orders, use_container_width=True)
-        st.markdown(st.session_state.get("rebal_md", ""))
-
-    sheet = st.session_state.get("order_sheet")
-    if sheet is not None:
-        st.subheader("📋 操作单 (可直接下单)")
-        st.caption("委托价=最新收盘价±0.3%缓冲 | 止损8% | 止盈20% | 数量取整到100股")
-        st.dataframe(sheet, use_container_width=True, hide_index=True)
-        with st.expander("操作单说明"):
-            st.markdown(st.session_state.get("order_sheet_md", ""))
-
-    if st.button("📨 推送通知"):
-        from live.notify import notify
-        md = st.session_state.get("order_sheet_md") or st.session_state.get("rebal_md")
-        if md:
-            ok = notify(cfg, md)
-            st.success("已推送" if ok else "推送未成功 (检查 notify 配置)")
-        else:
-            st.warning("请先生成信号")
 
 
 # ============== 页面: 轮动策略 ==============
@@ -414,18 +752,362 @@ def page_rotation():
         st.markdown(signal_to_markdown(sig))
 
 
+# ============== 页面: 短线博弈 ==============
+def page_shortterm():
+    st.title("🎰 短线博弈")
+    st.caption("情绪温度计 · 打板梯队 · 题材热度 · 龙虎榜游资 · 风控仓位（免费）")
+
+    # ---- stale-while-revalidate: 秒开(用上次数据) + 后台静默刷新 + 仅变化才整体重渲染 ----
+    from datetime import timedelta
+
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _fetch():
+        from strategy.short_term import market_sentiment, limit_up_ladder, strong_pool
+        from strategy.hot_money import concept_heatboard, dragon_tiger, hot_seats, institution_flow
+        from collector.aux_collector import latest_closed_trade_date
+        d = latest_closed_trade_date().replace("-", "")
+        return {
+            "date": d,
+            "sent": market_sentiment(d),
+            "ladder": limit_up_ladder(d),
+            "strong": strong_pool(d),
+            "concepts": concept_heatboard(),
+            "dt": dragon_tiger(d),
+            "seats": hot_seats(d),
+            "inst": institution_flow(d),
+        }
+
+    if "st_bundle" not in st.session_state:
+        st.session_state["st_bundle"] = None
+
+    def _sig(b):
+        """数据指纹: 变了才值得重渲染。"""
+        if not b:
+            return None
+        s = b.get("sent", {}) or {}
+        try:
+            topc = b["concepts"].iloc[0]["板块"] if (b.get("concepts") is not None and not b["concepts"].empty) else ""
+        except Exception:
+            topc = ""
+        return (s.get("date"), s.get("n_zt"), s.get("max_streak"), int(s.get("temp", 0)), topc)
+
+    ctrl = st.columns([2, 1, 3])
+    auto = ctrl[0].checkbox("🔄 后台静默刷新（每60秒）", value=True,
+                            help="用上次数据秒开，后台刷新，只有数据真变了才整体重渲染")
+    if ctrl[1].button("🔄 立即刷新", key="st_refresh"):
+        _fetch.clear()
+        try:
+            st.session_state["st_bundle"] = _fetch()
+        except Exception as e:
+            ctrl[2].error(f"刷新失败: {e}")
+        st.rerun()
+
+    # 后台 fragment: 静默取新数据, 指纹变了才统一重渲染(不变就不闪)
+    if auto:
+        @st.fragment(run_every=timedelta(seconds=60))
+        def _bg():
+            try:
+                fresh = _fetch()
+                if _sig(fresh) != _sig(st.session_state.get("st_bundle")):
+                    st.session_state["st_bundle"] = fresh
+                    st.rerun()
+            except Exception:
+                pass
+        _bg()
+        ctrl[2].caption("⏱️ 后台静默刷新中，数据有变化才更新页面")
+
+    # 优先用 session_state 里的上次数据立即渲染(秒开, 无转圈)
+    b = st.session_state["st_bundle"]
+    if b is None:
+        with st.spinner("首次加载盘面数据…"):  # 仅首次访问会有这一次短暂等待
+            try:
+                b = _fetch()
+                st.session_state["st_bundle"] = b
+            except Exception as e:
+                st.error(f"盘面数据获取失败(可能被限流): {e}")
+                st.info("稍后点「🔄 立即刷新」重试。短线打板对新手是高风险负和游戏, 仅供参考。")
+                return
+
+    sent = b["sent"]
+    # ---- 情绪温度计大圆盘 ----
+    c_gauge, c_info = st.columns([1, 1])
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=sent["temp"],
+        title={"text": "情绪温度"},
+        gauge={"axis": {"range": [0, 100]},
+               "bar": {"color": "#e74c3c"},
+               "steps": [
+                   {"range": [0, 30], "color": "#3ecf8e"},
+                   {"range": [30, 50], "color": "#f5c518"},
+                   {"range": [50, 75], "color": "#f39c12"},
+                   {"range": [75, 100], "color": "#e74c3c"}],
+               "threshold": {"line": {"width": 4}, "thickness": 1, "value": sent["temp"]}},
+    ))
+    fig.update_layout(height=260, margin=dict(t=40, b=10))
+    c_gauge.plotly_chart(fig, use_container_width=True)
+    c_info.metric("能否下嘴", sent["can_play"])
+    c_info.write(f"涨停 **{sent['n_zt']}** · 跌停 {sent['n_dt']} · 炸板 {sent['n_zbgc']}(率 {sent['zha_rate']:.0%}) · 高度 **{sent['max_streak']}连**")
+    c_info.info(sent["advice"])
+
+    # ---- 风控仓位计算器 ----
+    st.divider()
+    st.subheader("🧮 风控仓位计算器")
+    cap = st.number_input("总资金(元)", value=1_000_000, step=100_000, key="st_cap")
+    pool_cap = cap * 0.30     # 短线总仓上限
+    per_cap = cap * 0.10      # 单只上限
+    if sent["temp"] < 30:
+        st.warning(f"情绪温度 {sent['temp']}<30, 退潮期打板大概率吃面 → **本期不做, 仓位 0**。")
+    else:
+        st.write(f"短线总仓上限 ¥{pool_cap:,.0f}（30%）· 单只上限 ¥{per_cap:,.0f}（10%）· 止损 5%")
+        strong = b["strong"]
+        if "现价" in strong.columns and not strong.empty:
+            picks = strong[strong["现价"].notna() & (strong["现价"] > 0)].head(5)
+            rows = []
+            used = 0.0
+            for _, r in picks.iterrows():
+                px = float(r["现价"])
+                tgt_val = min(per_cap, (pool_cap - used))
+                if tgt_val < px * 100:
+                    continue
+                shares = int(tgt_val / px / 100) * 100
+                if shares <= 0:
+                    continue
+                amt = shares * px
+                used += amt
+                rows.append({"代码": r["代码"], "名称": r["名称"], "现价": px,
+                             "买入股数": shares, "金额": round(amt, 0),
+                             "止损价": round(px * 0.95, 2), "涨跌幅": r.get("涨跌幅")})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                st.caption(f"合计 ¥{sum(r['金额'] for r in rows):,.0f} / 上限 ¥{pool_cap:,.0f}。"
+                           "⚠️ 单只≤10%、破板/亏5%即走、不补仓。情绪退潮立即全部清仓。")
+            else:
+                st.info("无合适标的(价格缺失或资金不足)。")
+
+    # ---- 打板梯队 + 强势股 ----
+    st.divider()
+    col = st.columns(2)
+    with col[0].expander("🎯 打板连板梯队", expanded=True):
+        _safe_table(b["ladder"].head(20) if b.get("ladder") is not None else None, "暂无连板数据")
+    with col[1].expander("💪 强势股(成交额前列)", expanded=True):
+        _safe_table(b.get("strong"), "暂无强势股数据")
+
+    # ---- 题材 + 龙虎榜 (默认展开, 空数据给提示, 渲染异常不抛堆栈) ----
+    st.divider()
+    col = st.columns(2)
+    with col[0].expander("🔥 题材热度（按热度分排序）", expanded=True):
+        c = b.get("concepts")
+        if c is None or (hasattr(c, "empty") and c.empty):
+            st.warning("题材数据暂不可用（东财实时接口被限流）。点上方「🔄 立即刷新」重试，或过几分钟再来。")
+        else:
+            _safe_table(c, "暂无题材数据")
+            if "热度分" not in c.columns:
+                st.caption("ℹ️ 实时涨跌暂不可用(东财限流)，当前仅显示题材名称列表。")
+    with col[1].expander("🐉 龙虎榜个股(净买前列)", expanded=True):
+        _safe_table(b.get("dt"), "今日暂无龙虎榜数据（可能未到披露时间或被限流）")
+    col = st.columns(2)
+    with col[0].expander("🏦 游资营业部(净额前列)", expanded=True):
+        _safe_table(b.get("seats"), "暂无游资席位数据")
+    with col[1].expander("🏛️ 机构净买个股", expanded=True):
+        _safe_table(b.get("inst"), "暂无机构净买数据")
+
+    st.caption("⚠️ 短线打板对新手是高风险负和游戏(对手是游资+量化+手续费)。数据为盘后/盘中快照, 仅供参考, 不构成投资建议。")
+
+
+# ============== 页面: 盘中预警 (Pro) ==============
+def page_intraday():
+    from app.paywall import locked_page, license_info
+    if not locked_page("⚡ 盘中盯盘预警",
+                       "实时监控涨停/封板/炸板, 触发即推送(webhook/邮件)。内置冷静期与风控门槛, 防止上头。"):
+        return
+    st.title("⚡ 盘中盯盘预警")
+    info = license_info()
+    st.success(f"✅ Pro 已激活 (到期 {info['exp']})")
+
+    from live.intraday_monitor import is_market_hours, _watch_codes, ALERT_LOG
+    cfg = get_cfg()
+    codes = _watch_codes(cfg)
+    c1, c2 = st.columns(2)
+    c1.metric("监控池", f"{len(codes)} 只")
+    c2.metric("交易时段", "是 ✅" if is_market_hours() else "否（盘外）")
+
+    st.subheader("监控池（watchlist 龙头）")
+    st.write("、".join(codes))
+
+    st.subheader("启动守护进程")
+    st.code("python -m live.intraday_monitor            # 仅交易时段轮询\n"
+            "python -m live.intraday_monitor --interval 30   # 自定义间隔\n"
+            "python -m live.intraday_monitor --test     # 立即跑一轮测试推送", language="bash")
+    st.caption("建议用 launchd/终端后台常驻。预警写 data/cache/intraday_alerts.log 并推送 webhook/邮件。")
+
+    if st.button("📨 立即测试推送一轮", type="primary"):
+        with st.spinner("抓取实时行情并检测..."):
+            try:
+                from live.intraday_monitor import run_once
+                state = {}
+                Path(ALERT_LOG).parent.mkdir(parents=True, exist_ok=True)
+                with open(ALERT_LOG, "a", encoding="utf-8") as fh:
+                    n = run_once(cfg, codes, state, fh, force=True)
+                if n:
+                    st.success(f"触发 {n} 条预警, 已推送(若 notify 已配置)")
+                else:
+                    st.info("本轮无预警触发（监控池中无接近涨停/封板/炸板的票，或 notify 未配置）。")
+            except Exception as e:
+                st.error(f"测试失败: {e}")
+
+    st.subheader("预警日志")
+    log_p = Path(ALERT_LOG)
+    if log_p.exists():
+        lines = log_p.read_text(encoding="utf-8").strip().splitlines()
+        st.text("\n".join(lines[-30:]) or "(空)")
+    else:
+        st.caption("暂无预警记录。")
+
+
+# ============== 页面: 自研模型 (Pro) ==============
+def page_model():
+    from app.paywall import locked_page, license_info
+    if not locked_page("🧠 自研模型训练",
+                       "自定义标签(收益/方向)+因子组+模型(LightGBM/Ridge), 一键训练评估保存。"
+                       "诚实显示命中率, 命中率<55%标注不可靠。"):
+        return
+    st.title("🧠 自研模型训练")
+    info = license_info()
+    st.success(f"✅ Pro 已激活 (到期 {info['exp']})")
+    st.caption("横截面面板模型: 各股滞后指标 → 未来N日收益/方向。单股短周期信噪比低, 结果仅供参考。")
+
+    cfg = get_cfg()
+    col = st.columns(4)
+    universe = col[0].selectbox("股票池", ["watchlist", "sector_leaders"], 0)
+    label = col[1].selectbox("标签", ["ret(收益回归)", "dir(涨跌方向)"], 0)
+    horizon = col[2].slider("预测天数", 3, 20, 5)
+    model_type = col[3].selectbox("模型", ["lgbm", "ridge"], 0)
+    train_end = st.text_input("训练截止日(此后为测试)", "2025-12-31")
+    label_key = "ret" if label.startswith("ret") else "dir"
+
+    if st.button("🚀 开始训练", type="primary"):
+        with st.spinner("建面板 + 训练 + 评估..."):
+            try:
+                from model.trainer import train_pipeline, metrics_to_markdown
+                m = train_pipeline(cfg, universe=universe, horizon=horizon,
+                                   label=label_key, model_type=model_type, train_end=train_end)
+                st.session_state["ml_metrics"] = m
+                st.success("训练完成 ✅")
+            except Exception as e:
+                st.error(f"训练失败: {e}")
+
+    m = st.session_state.get("ml_metrics")
+    if m:
+        st.markdown(metrics_to_markdown(m))
+
+    st.divider()
+    st.subheader(f"已保存模型（最多保留 5 个，按评测结果记录）")
+    try:
+        from model.trainer import list_models, delete_model
+        models = list_models()
+        if models:
+            rows = []
+            for x in models:
+                m = x["metrics"]
+                rows.append({
+                    "文件": x["file"],
+                    "股票池": m.get("universe"), "标签": m.get("label"), "模型": m.get("model"),
+                    "命中率": f"{m['direction_hit']:.1%}" if m.get("direction_hit") is not None else "-",
+                    "IC": m.get("IC"),
+                    "topK超额/日": m.get("topk_excess_per_day"),
+                    "测试区间": f"{m.get('test_start','')}~{m.get('test_end','')}",
+                    "可靠": "✅" if m.get("reliable") else "⚠️",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(f"共 {len(models)}/5 个。命中率<55% 标⚠️不可靠。新训练超出5个会自动删最旧。")
+            # 删除
+            with st.expander("🗑 删除某个模型"):
+                fn = st.selectbox("选择要删除的", [x["file"] for x in models], key="del_model")
+                if st.button("删除", key="do_del_model"):
+                    if delete_model(fn):
+                        st.success(f"已删除 {fn}"); st.rerun()
+                    else:
+                        st.error("删除失败")
+        else:
+            st.caption("暂无已保存模型。训练一个后会出现在这里。")
+    except Exception as e:
+        st.caption(f"读取模型列表失败: {e}")
+
+
+# ============== 页面: 推荐持仓 (模型选股输出) ==============
+def page_recommend():
+    st.subheader("🎯 模型推荐持仓")
+    st.caption("多因子模型在自选股里打分，选 top-N 作为目标持仓。生成后到「💼 持仓与推荐」看每只持仓的加仓/减仓建议。")
+    cfg = get_cfg()
+    nm = _names()
+    target_csv = ROOT / cfg["paths"]["cache_dir"] / "target_portfolio.csv"
+    cap = st.number_input("参考资金(元)", value=1_000_000, step=100_000, key="rec_cap")
+    if target_csv.exists():
+        target = pd.read_csv(target_csv)
+        try:
+            from live.order_sheet import get_latest_prices
+            tprices = get_latest_prices(target["qlib_code"].tolist(), cfg)
+        except Exception:
+            tprices = {}
+        rows = []
+        for _, r in target.iterrows():
+            px = tprices.get(r["qlib_code"])
+            val = r["weight"] * cap
+            sh = int(val / px / 100) * 100 if px and px > 0 else None
+            rows.append({"代码": r["code"], "名称": r.get("name", nm.get(str(r["code"]), "-")),
+                         "打分": round(r["score"], 3) if pd.notna(r.get("score")) else None,
+                         "权重": f"{r['weight']:.0%}", "现价": px,
+                         "建议股数": sh, "建议金额": round(sh * px) if sh and px else None})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(f"推荐 {len(target)} 只（基于最新一次模型打分）。")
+    else:
+        st.info("暂未生成推荐，点下方按钮生成。")
+    if st.button("🔄 重新生成推荐", type="primary", key="gen_rec"):
+        if not qlib_ready(cfg):
+            st.warning("qlib 数据未就绪，先在「🗃️ 数据采集」tab 采集并 dump。"); return
+        with st.spinner("跑模型打分生成推荐..."):
+            try:
+                from live.signal_generator import generate_target_portfolio, save_portfolio
+                save_portfolio(generate_target_portfolio(cfg), cfg)
+                st.success("推荐已生成 ✅"); st.rerun()
+            except Exception as e:
+                st.error(f"生成失败: {e}")
+
+
 # ============== 主导航 ==============
+def page_model_hub():
+    """自研模型一站式: 自选股 / 数据采集 / 参数配置 / 回测 / 推荐持仓 / 轮动策略 / 训练模型(Pro)。"""
+    st.title("🧪 自研模型")
+    st.caption("股票池与数据 → 配置 → 回测/推荐 → 轮动 → 训练模型，一站式策略研发。")
+    t0, t1, t2, t3, t4, t5, t6 = st.tabs(
+        ["⭐ 自选股", "🗃️ 数据采集", "⚙️ 参数配置", "📊 回测", "🎯 推荐持仓", "🔁 轮动策略", "🎓 训练模型(Pro)"])
+    with t0:
+        page_watchlist()
+    with t1:
+        page_data()
+    with t2:
+        page_config()
+    with t3:
+        page_backtest()
+    with t4:
+        page_recommend()
+    with t5:
+        page_rotation()
+    with t6:
+        page_model()
+
+
 PAGES = {
     "📈 概览": page_overview,
-    "⚙️ 配置": page_config,
-    "🗃️ 数据采集": page_data,
-    "📊 回测": page_backtest,
-    "🔁 轮动策略": page_rotation,
-    "📡 信号调仓": page_signals,
+    "💼 持仓与推荐": page_holdings,
+    "🧪 自研模型": page_model_hub,
+    "🎰 短线博弈": page_shortterm,
+    "⚡ 盘中预警 🔒": page_intraday,
 }
 
 st.sidebar.title("A股量化系统")
-choice = st.sidebar.radio("导航", list(PAGES.keys()), label_visibility="collapsed")
+choice = st.sidebar.radio("导航", list(PAGES.keys()), label_visibility="collapsed", key="nav_choice")
 st.sidebar.divider()
 st.sidebar.caption("akshare · qlib · 多因子选股")
 PAGES[choice]()

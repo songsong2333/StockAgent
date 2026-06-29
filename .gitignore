@@ -1,3 +1,6 @@
+# 许可证 (付费激活, 不入库)
+config/.license
+
 # Python
 __pycache__/
 *.py[cod]
