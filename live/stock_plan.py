@@ -47,18 +47,38 @@ def model_attitude(qlib_code: str, cfg: dict) -> dict:
 
 
 def swing_levels(high: np.ndarray, low: np.ndarray, close: np.ndarray,
-                 lookback: int = 30, band: float = 0.25) -> dict:
-    """找近期支撑/阻力, 只取距现价 ±band 内的有效波动(剔除急涨前的旧低位)。
+                 lookback: int = 30, band: float = 0.25, cluster_pct: float = 0.015) -> dict:
+    """找近期支撑/阻力: 近 lookback 日的盘中高/低点, 距现价 ±band 内, 相近价位合并(cluster_pct内合一)。
 
     返回:
-      resistance: 升序(最近的阻力在前, 即最低的阻力先列)
-      support: 降序(最近的支撑在前, 即最高的支撑先列)
+      resistance: 升序(最近阻力在前); resistance_touches: 各阻力触及次数(越大越关键)
+      support: 降序(最近支撑在前); support_touches: 各支撑触及次数
     """
-    h = high[-lookback:]; l = low[-lookback:]; c = close[-1]
+    h = high[-lookback:]; l = low[-lookback:]; c = float(close[-1])
     lo_bound, hi_bound = c * (1 - band), c * (1 + band)
-    resist = sorted({round(x, 2) for x in h.tolist() if c < x <= hi_bound})
-    support = sorted({round(x, 2) for x in l.tolist() if lo_bound <= x < c}, reverse=True)
-    return {"resistance": resist[:3], "support": support[:3]}
+    r_raw = sorted(round(float(x), 2) for x in h.tolist() if c < x <= hi_bound)
+    s_raw = sorted(round(float(x), 2) for x in l.tolist() if lo_bound <= x < c)
+
+    def cluster(levels):
+        """合并相差 ≤cluster_pct 的相邻价位为一簇, 返回 [(价位均值, 触及次数)]。"""
+        if not levels:
+            return []
+        groups = [[levels[0]]]
+        for x in levels[1:]:
+            if x <= groups[-1][-1] * (1 + cluster_pct):
+                groups[-1].append(x)
+            else:
+                groups.append([x])
+        return [(round(sum(g) / len(g), 2), len(g)) for g in groups]
+
+    res = cluster(r_raw)                 # 升序: 最低阻力(最近)在前
+    sup = list(reversed(cluster(s_raw)))  # 降序: 最高支撑(最近)在前
+    return {
+        "resistance": [p for p, _ in res[:3]],
+        "resistance_touches": [t for _, t in res[:3]],
+        "support": [p for p, _ in sup[:3]],
+        "support_touches": [t for _, t in sup[:3]],
+    }
 
 
 def price_levels(code: str, cfg: dict, capital: float = 1_000_000,
@@ -108,8 +128,10 @@ def price_levels(code: str, cfg: dict, capital: float = 1_000_000,
     # 兜底: 压力位必在现价之上, 支撑位必在现价之下(突破无近端高点时给百分比位)
     if not lv["resistance"]:
         lv["resistance"] = [round(last_close * 1.05, 2), round(last_close * 1.12, 2)]
+        lv["resistance_touches"] = [0, 0]
     if not lv["support"]:
         lv["support"] = [round(last_close * 0.95, 2)]
+        lv["support_touches"] = [0]
     extended = (last_close > ma20 * 1.10) or (m5 > 0.12)
     if extended:
         trend = f"短线急涨偏离 (5日{m5:+.0%}, 高于MA20 {(last_close/ma20-1):+.0%})"
@@ -146,6 +168,8 @@ def price_levels(code: str, cfg: dict, capital: float = 1_000_000,
         "atr": atr, "hi250": hi250, "lo250": lo250, "pos_high": pos_high, "range_pos": range_pos,
         "mom": {"m5": m5, "m20": m20, "m60": m60}, "vol_ratio": vol_ratio,
         "support": lv["support"], "resistance": lv["resistance"],
+        "resistance_touches": lv.get("resistance_touches", []),
+        "support_touches": lv.get("support_touches", []),
         "trend": trend, "extended": extended,
         "entry_low": entry_low, "entry_high": entry_high, "entry_hint": entry_hint,
         "stop": stop, "t1": t1, "t2": t2,

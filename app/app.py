@@ -141,6 +141,7 @@ def _analyst_info(code: str) -> dict:
         "date": str(r.get("日期", ""))[:10],
         "eps": float(eps) if pd.notna(eps) else None,
         "pe": float(pe) if pd.notna(pe) else None,
+        "implied_price": round(float(eps) * float(pe), 2) if pd.notna(eps) and pd.notna(pe) else None,
         "n_reports": int(r.get("近一月个股研报数", 0) or 0),
     }
 
@@ -215,15 +216,13 @@ def page_holdings():
                   "持仓股数": int(h.get("shares", 0)), "成本价": float(h.get("cost", 0) or 0)}
                  for qc, h in holdings.items()]
     edit_df = pd.DataFrame(edit_rows, columns=["代码", "名称", "持仓股数", "成本价"])
-    if "hold_df" not in st.session_state:
-        st.session_state["hold_df"] = edit_df
+    # 每轮从持仓 yaml 重建(不缓存 session_state), 让 data_editor 自己管编辑状态, 新增行才不会丢
     edited = st.data_editor(
-        st.session_state["hold_df"], num_rows="dynamic", use_container_width=True, key="holdings_editor",
+        edit_df, num_rows="dynamic", use_container_width=True, key="holdings_editor",
         column_config={"代码": st.column_config.TextColumn(width="small"),
                        "名称": st.column_config.TextColumn(width="medium"),
                        "持仓股数": st.column_config.NumberColumn(min_value=0, step=100),
                        "成本价": st.column_config.NumberColumn(min_value=0.0, step=0.001, format="%.3f")})
-    st.session_state["hold_df"] = edited  # 同步编辑
 
     cash_in = st.number_input("现金(元)", value=cash, step=10000.0, key="cash_in")
     if st.button("💾 保存持仓", type="primary", key="save_holdings"):
@@ -255,11 +254,6 @@ def page_holdings():
         holdings_path.write_text(
             yaml.safe_dump({"cash": float(cash_in), "holdings": new_hold},
                            allow_unicode=True, sort_keys=False), encoding="utf-8")
-        # 用解析后的结果刷新表格(名称→代码 已带出)
-        st.session_state["hold_df"] = pd.DataFrame([
-            {"代码": qc[2:], "名称": h.get("name", "") or nm.get(qc[2:], ""),
-             "持仓股数": int(h.get("shares", 0)), "成本价": float(h.get("cost", 0) or 0)}
-            for qc, h in new_hold.items()])
         st.success(f"已保存 {len(new_hold)} 只持仓 ✅"); st.rerun()
 
     # ---------- ② 持仓调仓建议: 现价/市值/浮盈 + 加仓/减仓/止损价位 ----------
@@ -306,8 +300,8 @@ def page_holdings():
             cost = float(h.get("cost", 0) or 0)
             try:
                 p = price_levels(code, cfg, live_px=live_px.get(code))
-            except Exception:
-                missing.append(code)
+            except Exception as e:
+                missing.append(f"{code}: {type(e).__name__}: {e}")
                 continue
             px = live_px.get(code) or p["last_close"]   # 优先实时价
             mv = shares * px
@@ -320,6 +314,15 @@ def page_holdings():
                 ai = {}
             sup = p["support"][0] if p["support"] else None
             res = p["resistance"]
+            rtouch = p.get("resistance_touches", [])
+
+            def _lvl(vals, touches, i):
+                """安全取第 i 个价位(带触及次数); 长度不够返回'-'。"""
+                if len(vals) <= i:
+                    return "-"
+                t = touches[i] if len(touches) > i else 0
+                return f"{round(vals[i], 2)}" + (f" ({t}次)" if t else "")
+
             advice_rows.append({
                 "代码": code, "名称": nm.get(code, h.get("name", "-")), "持仓": shares,
                 "成本": round(cost, 3), "现价": round(px, 2), "市值": round(mv),
@@ -328,16 +331,40 @@ def page_holdings():
                 "距250日高": f"{p['pos_high']:+.1%}",
                 "支撑位": round(sup, 2) if sup else "-",
                 "加仓区间": f"{p['entry_low']:.2f}~{p['entry_high']:.2f}",
-                "压力位1": round(res[0], 2) if len(res) > 0 else "-",
-                "压力位2": round(res[1], 2) if len(res) > 1 else "-",
+                "压力位1": _lvl(res, rtouch, 0),
+                "压力位2": _lvl(res, rtouch, 1),
                 "止损": round(p["stop"], 2),
                 "机构评级": f"{ai.get('rating','')}{('·'+ai['org']) if ai.get('org') else ''}" or "-",
-                "研报估值(26E)": f"EPS {ai['eps']:.2f} / PE {ai['pe']:.0f}" if ai.get("eps") and ai.get("pe") else "-",
+                "研报估值(26E)": (f"EPS {ai['eps']:.2f}×PE {ai['pe']:.0f}≈{ai['implied_price']}"
+                                 if ai.get("implied_price") else "-"),
             })
         if advice_rows:
-            st.dataframe(pd.DataFrame(advice_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(advice_rows), use_container_width=True, hide_index=True,
+                         column_config={
+                             "止损": st.column_config.NumberColumn(
+                                 help="止损价 = 入场区下沿 − 1.5×ATR(14)。\n"
+                                      "• ATR(14) = 近14日「平均真实波幅」，即每天正常波动幅度均值。\n"
+                                      "• 1.5×ATR = 给正常波动留的余地；跌破说明不是正常震荡、是趋势坏了→离场。\n"
+                                      "• 入场下沿：急涨偏离时=MA10/MA20下方；正常时=近端支撑/MA20下方。\n"
+                                      "• 注：现相对「假设加仓入场区」算，急涨股的止损离现价较远。"),
+                             "加仓区间": st.column_config.TextColumn(
+                                 help="回踩低吸区。急涨偏离时=MA10/MA20附近(不追高)；正常时=近端支撑~现价。回到此区间可加仓。"),
+                             "压力位1": st.column_config.TextColumn(
+                                 help="近30日盘中高点(高于现价)，1.5%内合并为一，括号内=触及次数(越多阻力越实)。到价可分批减仓。"),
+                             "压力位2": st.column_config.TextColumn(
+                                 help="第二档压力位(更远)。同上算法，触及次数越多越关键。"),
+                             "支撑位": st.column_config.TextColumn(
+                                 help="近30日盘中低点(低于现价)，1.5%内合并为一。触及次数越多支撑越扎实。"),
+                             "研报估值(26E)": st.column_config.TextColumn(
+                                 help="估值价 = 2026年预测EPS × 预测PE。\n"
+                                      "• EPS = 机构对2026年每股收益的一致/最新预测。\n"
+                                      "• PE = 对应2026E EPS的市盈率。\n"
+                                      "• 估值价 = EPS×PE，即「按机构预测的盈利和PE，该值多少钱」。\n"
+                                      "• 对比现价：估值价>现价=机构隐含看涨空间；<现价=偏贵。"),
+                         })
             st.caption(f"股票市值 ¥{total_mv:,.0f} · 现金 ¥{cash:,.0f} · 合计 ¥{total_mv+cash:,.0f}。"
-                       "现价=实时最新价；加仓/减仓/止损 基于历史技术面(数据若旧请去「数据采集」更新)。")
+                       "现价=实时最新价；加仓/减仓/止损 基于历史技术面(数据若旧请去「数据采集」更新)。"
+                       "💡 列头有 ⓘ 图标的，鼠标悬停可看计算原理。")
             if missing:
                 st.caption(f"⚠️ 这些持仓没算出价位(需先采集日线): {missing}")
         else:
@@ -355,23 +382,23 @@ def page_holdings():
 def page_watchlist():
     import yaml
     st.title("⭐ 自选股")
-    st.caption("你关注的股票池，驱动模型选股/回测/推荐/盯盘。表格内直接改/加/删，代码或名称填一个即可（保存时自动互查）。")
+    st.caption("你关注的股票池，驱动模型选股/回测/推荐/盯盘。"
+               "**表格底部 ＋ 加行**（或选中行删除），代码/名称填一个即可，改完点「💾 保存自选」。"
+               "填完一格后记得按 **Tab/回车** 让单元格落定，再点保存。")
     nm = _names()
     path = ROOT / "config" / "watchlist.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text("stocks: []\n", encoding="utf-8")
+    # 每轮从 yaml 重建表格(不缓存到 session_state), 让 data_editor 自己管编辑状态
     stocks = _load_yaml_stocks("config/watchlist.yaml")
     edit_df = pd.DataFrame([{"代码": s.get("code", ""), "名称": s.get("name", "")} for s in stocks],
                            columns=["代码", "名称"])
-    if "wl_df" not in st.session_state:
-        st.session_state["wl_df"] = edit_df
     edited = st.data_editor(
-        st.session_state["wl_df"], num_rows="dynamic", use_container_width=True,
+        edit_df, num_rows="dynamic", use_container_width=True,
         key="wl_editor", hide_index=True,
         column_config={"代码": st.column_config.TextColumn(width="small", help="6位代码或名称"),
-                       "名称": st.column_config.TextColumn(width="large", help="留空保存时自动带出")})
-    st.session_state["wl_df"] = edited  # 同步编辑
+                       "名称": st.column_config.TextColumn(width="large", help="填名称保存时自动带代码")})
 
     if st.button("💾 保存自选", type="primary", key="save_watchlist"):
         name_to_code = {v: k for k, v in nm.items()} if nm else {}
@@ -399,8 +426,6 @@ def page_watchlist():
         if unresolved:
             st.warning(f"未识别出代码(检查名称/代码): {unresolved}")
         path.write_text(yaml.safe_dump({"stocks": new}, allow_unicode=True, sort_keys=False), encoding="utf-8")
-        st.session_state["wl_df"] = pd.DataFrame(
-            [{"代码": s["code"], "名称": s["name"]} for s in new], columns=["代码", "名称"])
         st.success(f"已保存 {len(new)} 只自选 ✅")
         st.rerun()
 
@@ -594,7 +619,7 @@ def page_data():
             with st.spinner("转换为 qlib bin..."):
                 dump(cfg)
         st.success(f"采集完成: {ok}/{len(all_codes)} 只成功 ✅")
-        st.rerun()
+        # 不调 st.rerun(): 下方"数据状态"会在本次渲染刷新; rerun 会与导航 widget 撞 key
 
     st.divider()
     with st.expander("⚙️ 高级：指定代码 / 全市场（慎用）"):
@@ -615,7 +640,8 @@ def page_data():
                                cfg["collector"].get("adjust", "qfq"),
                                cfg["collector"]["max_retries"], cfg["collector"]["request_sleep"])
             dump(cfg)
-            st.success("完成 ✅"); st.rerun()
+            st.success("完成 ✅")
+            # 不调 st.rerun()(避免与导航 widget 撞 key); 下方数据状态本次渲染即刷新
 
     st.divider()
     st.subheader("数据状态")
@@ -792,28 +818,15 @@ def page_shortterm():
         return (s.get("date"), s.get("n_zt"), s.get("max_streak"), int(s.get("temp", 0)), topc)
 
     ctrl = st.columns([2, 1, 3])
-    auto = ctrl[0].checkbox("🔄 后台静默刷新（每60秒）", value=True,
-                            help="用上次数据秒开，后台刷新，只有数据真变了才整体重渲染")
+    ctrl[0].caption("🔄 用缓存秒开；点右边立即刷新")
     if ctrl[1].button("🔄 立即刷新", key="st_refresh"):
         _fetch.clear()
         try:
             st.session_state["st_bundle"] = _fetch()
         except Exception as e:
             ctrl[2].error(f"刷新失败: {e}")
-        st.rerun()
-
-    # 后台 fragment: 静默取新数据, 指纹变了才统一重渲染(不变就不闪)
-    if auto:
-        @st.fragment(run_every=timedelta(seconds=60))
-        def _bg():
-            try:
-                fresh = _fetch()
-                if _sig(fresh) != _sig(st.session_state.get("st_bundle")):
-                    st.session_state["st_bundle"] = fresh
-                    st.rerun()
-            except Exception:
-                pass
-        _bg()
+    # 注: 不再用 @st.fragment(run_every) 自动刷新——其内部的 st.rerun() 异步触发会与
+    # 侧栏导航 widget 撞 key, 导致整个 app 崩溃(StreamlitDuplicateElementKey)。改用手动刷新。
         ctrl[2].caption("⏱️ 后台静默刷新中，数据有变化才更新页面")
 
     # 优先用 session_state 里的上次数据立即渲染(秒开, 无转圈)
@@ -1077,24 +1090,26 @@ def page_recommend():
 
 # ============== 主导航 ==============
 def page_model_hub():
-    """自研模型一站式: 自选股 / 数据采集 / 参数配置 / 回测 / 推荐持仓 / 轮动策略 / 训练模型(Pro)。"""
+    """自研模型一站式: 子导航切换模块(只渲染当前模块, 避免 st.tabs 一次性渲染全部
+    导致与侧栏导航 widget 撞 key 的 Streamlit 1.50 bug)。"""
     st.title("🧪 自研模型")
     st.caption("股票池与数据 → 配置 → 回测/推荐 → 轮动 → 训练模型，一站式策略研发。")
-    t0, t1, t2, t3, t4, t5, t6 = st.tabs(
-        ["⭐ 自选股", "🗃️ 数据采集", "⚙️ 参数配置", "📊 回测", "🎯 推荐持仓", "🔁 轮动策略", "🎓 训练模型(Pro)"])
-    with t0:
+    modules = ["⭐ 自选股", "🗃️ 数据采集", "⚙️ 参数配置", "📊 回测",
+               "🎯 推荐持仓", "🔁 轮动策略", "🎓 训练模型(Pro)"]
+    sub = st.radio("模块", modules, horizontal=True, key="model_sub")
+    if sub == "⭐ 自选股":
         page_watchlist()
-    with t1:
+    elif sub == "🗃️ 数据采集":
         page_data()
-    with t2:
+    elif sub == "⚙️ 参数配置":
         page_config()
-    with t3:
+    elif sub == "📊 回测":
         page_backtest()
-    with t4:
+    elif sub == "🎯 推荐持仓":
         page_recommend()
-    with t5:
+    elif sub == "🔁 轮动策略":
         page_rotation()
-    with t6:
+    elif sub == "🎓 训练模型(Pro)":
         page_model()
 
 
@@ -1107,7 +1122,13 @@ PAGES = {
 }
 
 st.sidebar.title("A股量化系统")
-choice = st.sidebar.radio("导航", list(PAGES.keys()), label_visibility="collapsed", key="nav_choice")
+# 用 URL query_params 记住当前页, 刷新/重开后回到原页而非概览
+_saved = st.query_params.get("page")
+_default = list(PAGES.keys()).index(_saved) if _saved in PAGES else 0
+choice = st.sidebar.radio("导航", list(PAGES.keys()), index=_default,
+                          label_visibility="collapsed", key="nav_choice")
+if st.query_params.get("page") != choice:
+    st.query_params["page"] = choice
 st.sidebar.divider()
 st.sidebar.caption("akshare · qlib · 多因子选股")
 PAGES[choice]()
