@@ -930,7 +930,7 @@ def page_shortterm():
 
 # ============== 页面: 盘中预警 (Pro) ==============
 def page_intraday():
-    from app.paywall import locked_page, license_info
+    from paywall import locked_page, license_info
     if not locked_page("⚡ 盘中盯盘预警",
                        "实时监控涨停/封板/炸板, 触发即推送(webhook/邮件)。内置冷静期与风控门槛, 防止上头。"):
         return
@@ -980,7 +980,7 @@ def page_intraday():
 
 # ============== 页面: 自研模型 (Pro) ==============
 def page_model():
-    from app.paywall import locked_page, license_info
+    from paywall import locked_page, license_info
     if not locked_page("🧠 自研模型训练",
                        "自定义标签(收益/方向)+因子组+模型(LightGBM/Ridge), 一键训练评估保存。"
                        "诚实显示命中率, 命中率<55%标注不可靠。"):

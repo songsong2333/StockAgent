@@ -68,7 +68,7 @@ hiddenimports += [
 ]
 # 本项目模块: app.py 由 streamlit 以脚本形式 exec, 静态分析看不到其 import,
 # 必须显式收集, 否则打包后页面 import collector/backtest/live/factor/strategy 会失败
-hiddenimports += ["common", "collector", "backtest", "live", "factor", "strategy", "scripts"]
+hiddenimports += ["common", "paywall", "collector", "backtest", "live", "factor", "strategy", "scripts"]
 for pkg in ("collector", "backtest", "live", "factor", "strategy", "scripts"):
     try:
         hiddenimports += collect_submodules(pkg)

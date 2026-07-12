@@ -165,7 +165,7 @@ def main():
     p.add_argument("--test", action="store_true", help="非交易时段强制跑一轮(测试推送)")
     args = p.parse_args()
     cfg = load_config()
-    from app.paywall import is_pro
+    from paywall import is_pro
     if not is_pro():
         print("⛔ 需要 Pro 激活。用 scripts/gen_license.py 生成码并在 App 内激活。")
         return

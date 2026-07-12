@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.paywall import encode_license, _secret
+from paywall import encode_license, _secret
 
 
 def main():
