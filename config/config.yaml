@@ -8,6 +8,7 @@ paths:
   qlib_dir: data/qlib_data     # qlib bin 格式数据
   cache_dir: data/cache        # 财务/ST/持仓/日志等缓存
   log_dir: data/cache/logs
+  etf_dir: data/etf            # ETF parquet(独立于个股 raw_dir, 不走qlib)
 
 # ---------------- 数据采集 ----------------
 collector:
@@ -39,6 +40,28 @@ rotation:
   freq: 5                       # 调仓频率(交易日)
   mom_win: 60                   # 动量窗口
   bias_max: 0.20                # 乖离过滤上限(越低越不追高)
+
+# ---------------- ETF 策略 ----------------
+# 成本(佣金/最低5元/整手/T+1/成交价)复用下方 backtest 段; ETF 免印花税, 回测时跳过 stamp_duty。
+etf:
+  pool_file: config/etf_pool.yaml   # 分层标的池(broad/sector + benchmark_etf)
+  benchmark_etf: "510300"           # 大盘择时基准标的(沪深300ETF)
+  backtest_start: "2019-01-01"      # 回测起始日(早于此无数据)
+  initial_capital: 1000000          # 初始资金(影响最低佣金门槛是否触发)
+  trend:                            # 趋势择时(宽基+避险池)
+    ma_short: 20
+    ma_long: 60
+    confirm_days: 2                 # 防抖: 信号需连续确认N日
+    band_filter: 0.005              # 防抖: 均线带宽过滤(0.5%, 震荡市不打脸)
+    rebalance_freq: 5               # 调仓频率(交易日): 5=周 20=月
+  rotation:                         # 动量轮动
+    broad_topn: 3                   # 宽基池持仓数
+    sector_topn: 3                  # 行业池持仓数
+    mom_short: 20                   # 短线动量窗口(行业池用)
+    mom_long: 60                    # 中长期动量窗口
+    sector_market_timing: true      # 行业池叠大盘择时开关(空头空仓避险)
+    bench_ma: 60                    # 大盘MA窗口
+    rebalance_freq: 5
 
 # ---------------- 因子与模型 ----------------
 model:

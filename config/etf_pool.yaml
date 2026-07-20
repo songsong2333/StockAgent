@@ -1,0 +1,25 @@
+# 场内 ETF 分层标的池
+# 代码全部用原始6位, 不做 SH/SZ 转换(ETF 不走 qlib)。
+# A类 broad(宽基+避险): 低频趋势择时/动量轮动;
+# B类 sector(行业/主题): 短线轮动, 必须叠大盘择时开关(基准在 benchmark_etf)。
+# ⚠️ 标 [需验证] 的代码采集时若失败会跳过; 同标的可能有多个ETF, 选流动性最大的那只。
+
+benchmark_etf: "510300"        # 大盘择时基准(沪深300ETF, 与持仓同源同复权)
+
+broad:                         # A类: 宽基指数 + 避险
+  - {code: "510300", name: "沪深300ETF",  category: broad_index}
+  - {code: "510500", name: "中证500ETF",  category: broad_index}
+  - {code: "512100", name: "中证1000ETF", category: broad_index}   # [需验证, 或 560010]
+  - {code: "159915", name: "创业板ETF",   category: broad_index}
+  - {code: "588000", name: "科创50ETF",   category: broad_index}
+  - {code: "518880", name: "黄金ETF",     category: safe_haven}
+
+sector:                        # B类: 行业/主题ETF (看大盘趋势做相对短线)
+  - {code: "512480", name: "半导体ETF",  sector: 半导体}
+  - {code: "159755", name: "电池ETF",    sector: 新能源}
+  - {code: "159928", name: "消费ETF",    sector: 消费}
+  - {code: "512800", name: "银行ETF",    sector: 金融}
+  - {code: "512010", name: "医药ETF",    sector: 医药}
+  - {code: "512660", name: "军工ETF",    sector: 军工}
+  - {code: "515030", name: "新能源车ETF", sector: 新能源}   # [需验证]
+  - {code: "515790", name: "光伏ETF",    sector: 新能源}   # [需验证]
