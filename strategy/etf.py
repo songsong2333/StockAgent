@@ -364,6 +364,51 @@ def _latest_trend_states(close: pd.DataFrame, codes: list, ma_short: int, ma_lon
     return states
 
 
+def single_etf_status(code: str, cfg: dict, ma_short: Optional[int] = None,
+                      ma_long: Optional[int] = None, confirm_days: Optional[int] = None,
+                      band_filter: Optional[float] = None) -> Optional[dict]:
+    """查单只ETF最新趋势状态(用户持仓可能不在 broad 池)。
+
+    返回与 trend_signal candidates 行同构的 dict(含 above_ma20/above_ma60), 或 None(无数据)。
+    """
+    ec = cfg.get("etf", {}); tc = ec.get("trend", {})
+    ma_short = tc.get("ma_short", 20) if ma_short is None else ma_short
+    ma_long = tc.get("ma_long", 60) if ma_long is None else ma_long
+    confirm_days = tc.get("confirm_days", 2) if confirm_days is None else confirm_days
+    band_filter = tc.get("band_filter", 0.005) if band_filter is None else band_filter
+    code = str(code).strip().zfill(6)
+    close, _, _, names, _ = load_etf_panel(cfg, "broad")
+    if code in close.columns:
+        s = close[code].dropna()
+        name = names.get(code, code)
+    else:
+        p = _resolve_etf_dir(cfg) / f"{code}.parquet"
+        if not p.exists():
+            return None
+        df = pd.read_parquet(p); df["date"] = pd.to_datetime(df["date"])
+        s = df.set_index("date")["close"].astype(float).sort_index()
+        try:
+            from collector.etf_collector import load_etf_pool
+            pool = load_etf_pool(cfg)
+            name = next((it["name"] for grp in ("broad", "sector")
+                         for it in pool.get(grp, []) or []
+                         if str(it["code"]).strip().zfill(6) == code), code)
+        except Exception:
+            name = code
+    if len(s) < ma_long + 5:
+        return None
+    ma_s = s.rolling(ma_short).mean(); ma_l = s.rolling(ma_long).mean()
+    hold = _debounce((ma_s > ma_l).astype(int), confirm_days, band_filter, ma_s, ma_l)
+    ms_last = float(ma_s.iloc[-1]); ml_last = float(ma_l.iloc[-1]); px = float(s.iloc[-1])
+    return {
+        "code": code, "name": name, "close": round(px, 3),
+        "hold": int(hold.iloc[-1]), "raw": int(ms_last > ml_last),
+        "ma_short": round(ms_last, 3), "ma_long": round(ml_last, 3),
+        "band%": round(abs(ms_last - ml_last) / ml_last * 100, 2) if ml_last else 0.0,
+        "above_ma20": bool(px > ms_last), "above_ma60": bool(px > ml_last),
+    }
+
+
 def trend_signal(cfg: dict, ma_short: Optional[int] = None, ma_long: Optional[int] = None,
                  confirm_days: Optional[int] = None, band_filter: Optional[float] = None,
                  pool: str = "broad") -> dict:

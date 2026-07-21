@@ -801,19 +801,73 @@ def page_rotation():
 
 
 # ============== 页面: ETF策略 ==============
+_ETF_HOLDINGS_FILE = "data/cache/etf_holdings.yaml"
+
+
+def _load_etf_holdings() -> dict:
+    """加载ETF持仓 {code: {name, shares, cost, last_px}}。不存在返回 {}。"""
+    import yaml
+    p = ROOT / _ETF_HOLDINGS_FILE
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return (yaml.safe_load(f) or {}).get("holdings", {})
+
+
+def _save_etf_holdings(holdings: dict):
+    import yaml
+    p = ROOT / _ETF_HOLDINGS_FILE
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(yaml.safe_dump({"holdings": holdings}, allow_unicode=True, sort_keys=False),
+                 encoding="utf-8")
+
+
+def _trend_advice(status: Optional[dict], bench_bull: bool) -> tuple:
+    """根据单标趋势状态 + 大盘, 生成(动作, 人话原因)。status: single_etf_status 返回。"""
+    if not status:
+        return ("❓ 无数据", "该ETF未采集, 先运行 scripts/init_etf.py")
+    hold, raw, band, px = status["hold"], status["raw"], status["band%"], status["close"]
+    if hold == 1:
+        action = "✅ 持有"
+        if status.get("above_ma20", px > status["ma_short"]):
+            reason = f"多头排列稳固(带宽{band:.1f}%), 现价站上MA20, 趋势健康, 继续持有"
+        else:
+            base = "多头基础仍在(MA60之上)" if status.get("above_ma60") else "已破MA60, 趋势转弱"
+            reason = f"均线多头但现价跌破MA20, 短期回调; {base}, 持有但警惕"
+    elif raw == 1:
+        action = "⏳ 观望"
+        reason = f"MA20刚上穿MA60但未连续确认(带宽{band:.1f}%偏小), 等站稳再入场, 别追"
+    else:
+        action = "❌ 卖出"
+        reason = f"MA20下穿MA60死叉(带宽{band:.1f}%), 现价跌破均线, 趋势走弱, 建议卖出/不碰"
+    if not bench_bull:
+        reason += "; ⚠️大盘基准(沪深300)翻空, 系统性风险升温, 偏谨慎"
+    return (action, reason)
+
+
+def _rotation_reason(row) -> str:
+    """轮动候选的人话原因。row: rotation_signal 行(mom_long/mom_short/score)。"""
+    ml, ms = row.get("mom_long", 0), row.get("mom_short", 0)
+    parts = [f"长期{'强势' if ml > 20 else ('上涨' if ml > 0 else '走弱')}({ml:+.0f}%)"]
+    if ms > 5:
+        parts.append(f"短期加速({ms:+.0f}%)")
+    elif ms < -5:
+        parts.append(f"短期回调({ms:+.0f}%)")
+    parts.append(f"评分{row.get('score', 0):.2f}")
+    return ", ".join(parts)
+
+
 def _show_etf_backtest(bt: dict, daily_key: str, prefix: str, exposure_target: float = 0.15):
-    """ETF 回测通用展示: 回撤预算滑块 + 指标卡(含换手/佣金) + 净值曲线 + 交易明细。"""
+    """ETF 回测展示(expander 内调用): 回撤滑块 + 指标卡 + 净值曲线 + 交易明细。"""
     if bt["n_days"] < 2:
-        st.warning("ETF 数据不足(历史太短或未采集)。请先运行 `python scripts/init_etf.py --years 6`。")
+        st.warning("ETF 数据不足。请先运行 `python scripts/init_etf.py --years 6`。")
         return
     daily, bench_daily, dates = bt["daily_ret"], bt["bench_daily"], bt["dates"]
     full = metrics_from_returns(daily, 1.0)
-    target = st.slider(f"🎯 目标最大回撤 ({prefix})", 0.05, 0.30, exposure_target, 0.01,
-                       key=f"{daily_key}_dd")
+    target = st.slider(f"🎯 目标最大回撤 ({prefix})", 0.05, 0.30, exposure_target, 0.01, key=f"{daily_key}_dd")
     exposure = min(1.0, target / abs(full["max_dd"])) if full["max_dd"] != 0 else 1.0
     scaled = metrics_from_returns(daily, exposure)
     bench = metrics_from_returns(bench_daily, 1.0)
-
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("建议仓位", f"{exposure:.0%}", f"目标{target:.0%}")
     c2.metric("累计收益", f"{scaled['cum_ret']:+.1%}", f"满仓{full['cum_ret']:+.1%}")
@@ -821,7 +875,6 @@ def _show_etf_backtest(bt: dict, daily_key: str, prefix: str, exposure_target: f
     c4.metric("夏普", f"{scaled['sharpe']:.2f}", f"满仓{full['sharpe']:.2f}")
     c5.metric("年化换手", f"{bt['turnover_annual']:.1f}x", f"{bt['n_trades']}笔")
     c6.metric("总佣金", f"{bt['total_commission']:.0f}元", f"基准{bt['bench_cum']:+.1%}")
-
     fig = go.Figure()
     dts = pd.to_datetime(dates)
     fig.add_trace(go.Scatter(x=dts, y=full["curve"], name=f"满仓(回撤{full['max_dd']:.0%})",
@@ -830,10 +883,9 @@ def _show_etf_backtest(bt: dict, daily_key: str, prefix: str, exposure_target: f
                              line=dict(color="#e74c3c", width=2)))
     fig.add_trace(go.Scatter(x=dts, y=bench["curve"], name=f"基准(回撤{bench['max_dd']:.0%})",
                              line=dict(color="#3498db")))
-    fig.update_layout(height=400, hovermode="x unified", template="plotly_white", yaxis_title="净值")
+    fig.update_layout(height=380, hovermode="x unified", template="plotly_white", yaxis_title="净值")
     st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander(f"📋 交易明细 ({bt['n_trades']}笔, 总佣金{bt['total_commission']:.0f}元)"):
+    with st.expander(f"📋 历史交易明细 ({bt['n_trades']}笔, 总佣金{bt['total_commission']:.0f}元) — 仅回测参考, 非实盘"):
         tl = bt["trade_log"]
         if not tl.empty:
             st.dataframe(tl[["date", "code", "side", "shares", "price", "amount", "commission"]]
@@ -845,80 +897,175 @@ def _show_etf_backtest(bt: dict, daily_key: str, prefix: str, exposure_target: f
             st.caption("无交易记录。")
 
 
-def page_etf():
-    st.title("📊 ETF策略")
-    st.caption("场内宽基·趋势择时+动量轮动·精确成本(佣金万2.5+最低5元, ETF免印花税)·信号防抖")
-    cfg = get_cfg()
-    ec = cfg.get("etf", {})
+def _page_trend(cfg):
+    from strategy.etf import trend_signal, single_etf_status
+    ec = cfg.get("etf", {}); tc = ec.get("trend", {})
+    ma_s = int(tc.get("ma_short", 20)); ma_l = int(tc.get("ma_long", 60))
+    confirm = int(tc.get("confirm_days", 2)); band = float(tc.get("band_filter", 0.005))
+    bench_code = str(ec.get("benchmark_etf", "510300")).strip().zfill(6)
+    bench_st = single_etf_status(bench_code, cfg, ma_s, ma_l, confirm, band)
+    bench_bull = bool(bench_st and bench_st["hold"] == 1)
 
-    tab_trend, tab_rot = st.tabs(["📈 趋势择时", "🔄 动量轮动"])
+    # 1. 我的持仓与操作建议 (决策核心)
+    st.subheader("💼 我的持仓与操作建议")
+    holdings = _load_etf_holdings()
+    edit_df = pd.DataFrame(
+        [{"代码": c, "名称": h.get("name", c), "数量": h.get("shares", 0),
+          "成本": h.get("cost", 0.0), "最新现价": h.get("last_px")}
+         for c, h in holdings.items()],
+        columns=["代码", "名称", "数量", "成本", "最新现价"])
+    edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True,
+                            key="etf_holdings_editor")
+    if st.button("💾 保存持仓并刷新建议", key="etf_save_h", type="primary"):
+        new_h = {}
+        for _, r in edited.iterrows():
+            code = str(r.get("代码", "")).strip().zfill(6)
+            if not code or code == "000000":
+                continue
+            lpx = r.get("最新现价")
+            new_h[code] = {"name": str(r.get("名称", code)),
+                           "shares": int(r.get("数量", 0) or 0),
+                           "cost": float(r.get("成本", 0) or 0),
+                           "last_px": float(lpx) if pd.notna(lpx) else None}
+        _save_etf_holdings(new_h)
+        st.success("持仓已保存, 正在刷新建议...")
+        st.rerun()
 
-    # ---- 趋势择时 ----
-    with tab_trend:
-        tc = ec.get("trend", {})
+    if holdings:
+        rows = []
+        for code, h in holdings.items():
+            status = single_etf_status(code, cfg, ma_s, ma_l, confirm, band)
+            action, reason = _trend_advice(status, bench_bull)
+            lpx, cost = h.get("last_px"), h.get("cost")
+            pnl = (lpx / cost - 1) if (lpx and cost) else None
+            rows.append({"名称": h.get("name", code), "代码": code, "数量": h.get("shares", 0),
+                         "成本": cost, "最新现价": lpx if lpx else "—",
+                         "浮盈": f"{pnl:+.1%}" if pnl is not None else "填现价/查交易软件",
+                         "操作": action, "原因": reason})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption("💡 操作建议基于双均线趋势信号(宽基数据为指数点位, 信号通用); 浮盈需填『最新现价』(交易软件查)。")
+    else:
+        st.info("还没有持仓。点上方表格右下 ➕ 添加(代码/名称/数量/成本), 保存后即出操作建议。")
+
+    st.divider()
+
+    # 2. 今日趋势信号 (池子全貌, 分组, 用名称)
+    st.subheader("📡 今日趋势信号")
+    sig = trend_signal(cfg, ma_short=ma_s, ma_long=ma_l, confirm_days=confirm, band_filter=band)
+    cand = sig["candidates"]
+    groups = [
+        ("✅ 多头持有", "均线多头排列, 可持有", cand[cand["hold"] == 1]),
+        ("⏳ 待确认", "刚金叉/带宽不足, 别急着追", cand[(cand["hold"] == 0) & (cand["raw"] == 1)]),
+        ("❌ 空头观望", "死叉, 回避", cand[(cand["hold"] == 0) & (cand["raw"] == 0)]),
+    ]
+    for emoji_label, sub, df in groups:
+        if df.empty:
+            continue
+        st.markdown(f"**{emoji_label}** — {sub}")
+        for _, r in df.iterrows():
+            st.markdown(f"- {r['name']}（{r['code']}）现价 {r['close']}：MA20={r['ma_short']} / MA60={r['ma_long']}, 带宽 {r['band%']}%")
+
+    st.divider()
+
+    # 3. 市场温度
+    st.subheader("🌡️ 市场温度")
+    if bench_st:
+        mood = "大盘多头, 可持仓" if bench_bull else "大盘死叉翻空, 系统性风险升温, 整体偏谨慎"
+        st.markdown(f"**沪深300（{bench_code}）**: 现价 {bench_st['close']} vs MA60 {bench_st['ma_long']} → {'✅ 多头' if bench_bull else '❌ 空头'} — {mood}")
+    gold_st = single_etf_status("518880", cfg, ma_s, ma_l, confirm, band)
+    if gold_st:
+        gb = gold_st["hold"] == 1
+        gmood = "避险资产多头(避险情绪升温, 对股票ETF偏空)" if gb else "避险资产同步下跌(无港湾, 流动性偏紧)"
+        st.markdown(f"**黄金ETF（518880）**: 现价 {gold_st['close']} vs MA60 {gold_st['ma_long']} → {'✅' if gb else '❌'} — {gmood}")
+
+    st.divider()
+
+    # 4. 回测与调参 (折叠)
+    with st.expander("🔬 回测与调参（高级, 默认收起）", expanded=False):
         col = st.columns(5)
-        ma_s = col[0].slider("短均线", 5, 60, int(tc.get("ma_short", 20)), key="etf_t_ma_s")
-        ma_l = col[1].slider("长均线", 20, 250, int(tc.get("ma_long", 60)), key="etf_t_ma_l")
-        confirm = col[2].slider("确认日数(防抖)", 1, 5, int(tc.get("confirm_days", 2)), key="etf_t_confirm")
-        band = col[3].slider("带宽过滤%", 0.0, 3.0, float(tc.get("band_filter", 0.005)) * 100, 0.1,
-                             key="etf_t_band") / 100
-        freq = col[4].select_slider("调仓频率", [1, 5, 10, 20], int(tc.get("rebalance_freq", 5)),
-                                    key="etf_t_freq")
+        ma_s2 = col[0].slider("短均线", 5, 60, ma_s, key="etf_t_ma_s")
+        ma_l2 = col[1].slider("长均线", 20, 250, ma_l, key="etf_t_ma_l")
+        confirm2 = col[2].slider("确认日数", 1, 5, confirm, key="etf_t_confirm")
+        band2 = col[3].slider("带宽过滤%", 0.0, 3.0, band * 100, 0.1, key="etf_t_band") / 100
+        freq2 = col[4].select_slider("调仓频率", [1, 5, 10, 20], int(tc.get("rebalance_freq", 5)), key="etf_t_freq")
 
         @st.cache_data(show_spinner="回测趋势择时...", ttl=600)
         def _bt_trend(ma_s, ma_l, confirm, band, freq):
             from strategy.etf import backtest_trend
-            return backtest_trend(cfg, ma_short=ma_s, ma_long=ma_l,
-                                  confirm_days=confirm, band_filter=band, freq=freq)
+            return backtest_trend(cfg, ma_short=ma_s, ma_long=ma_l, confirm_days=confirm,
+                                  band_filter=band, freq=freq)
+        _show_etf_backtest(_bt_trend(ma_s2, ma_l2, confirm2, band2, freq2), "etf_trend", "趋势择时")
 
-        _show_etf_backtest(_bt_trend(ma_s, ma_l, confirm, band, freq), "etf_trend", "趋势择时")
 
-        st.subheader("本期趋势信号")
-        if st.button("🔄 生成最新信号", key="etf_t_sig", type="primary"):
-            with st.spinner("计算信号..."):
-                from strategy.etf import trend_signal
-                st.session_state["etf_trend_sig"] = trend_signal(
-                    cfg, ma_short=ma_s, ma_long=ma_l, confirm_days=confirm, band_filter=band)
-        sig = st.session_state.get("etf_trend_sig")
-        if sig:
-            from strategy.etf import signal_to_markdown
-            st.markdown(signal_to_markdown(sig))
+def _page_rotation(cfg):
+    from strategy.etf import rotation_signal
+    ec = cfg.get("etf", {}); rc = ec.get("rotation", {})
+    pool_label = st.radio("标的池", ["broad 宽基+黄金(稳健)", "sector 行业主题(叠大盘择时)"],
+                          horizontal=True, key="etf_r_pool")
+    pool_key = "broad" if pool_label.startswith("broad") else "sector"
+    topn = rc.get("sector_topn", 3) if pool_key == "sector" else rc.get("broad_topn", 3)
+    mom_l = int(rc.get("mom_long", 60)); mom_s = int(rc.get("mom_short", 20))
+    sig = rotation_signal(cfg, pool=pool_key, topn=int(topn), mom_long=mom_l, mom_short=mom_s)
 
-    # ---- 动量轮动 ----
-    with tab_rot:
-        rc = ec.get("rotation", {})
-        pool_label = st.radio("标的池", ["broad 宽基+黄金(稳健)", "sector 行业主题(叠大盘择时)"],
-                              horizontal=True, key="etf_r_pool")
-        pool_key = "broad" if pool_label.startswith("broad") else "sector"
+    # 1. 本期建议持有
+    st.subheader("🎯 本期建议持有")
+    if pool_key == "sector":
+        if sig["market_bull"]:
+            st.markdown(f"**大盘多头**（沪深300 {sig['bench_close']} > MA{sig['bench_ma']}）→ 允许持仓行业ETF")
+        else:
+            st.warning(f"⚠️ **大盘空头**（沪深300 {sig['bench_close']} < MA{sig['bench_ma']}）→ 本期**空仓避险**, 等大盘重回均线上方再入场")
+    top = sig["top"]
+    if top.empty:
+        st.info("本期无符合『上升趋势 + 动量』的标的 → 空仓观望。")
+    else:
+        rows = [{"名称": r["name"], "代码": r["code"], "现价": r["close"],
+                 "为什么选它": _rotation_reason(r)} for _, r in top.iterrows()]
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(f"等权持有 {len(top)} 只, 下期重新评分, 跌出 topN 或转弱则换出。")
+
+    # 2. 为什么没选其他
+    top_codes = set(top["code"].tolist()) if not top.empty else set()
+    excluded = sig["candidates"][~sig["candidates"]["code"].isin(top_codes)]
+    with st.expander(f"为什么没选其他（{len(excluded)} 只）"):
+        for _, r in excluded.iterrows():
+            st.markdown(f"- {r['name']}（{r['code']}）: {_rotation_reason(r)}")
+
+    # 3. 持仓对照
+    holdings = _load_etf_holdings()
+    if holdings:
+        st.subheader("💼 我的持仓对照轮动")
+        hr = [{"名称": h.get("name", c), "代码": c,
+               "轮动建议": "✅ 在 top, 继续持有" if c in top_codes else "⚠️ 不在 top, 考虑换出/减仓"}
+              for c, h in holdings.items()]
+        st.dataframe(pd.DataFrame(hr), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # 4. 回测 (折叠)
+    with st.expander("🔬 回测与调参（高级, 默认收起）", expanded=False):
         col = st.columns(4)
-        default_topn = rc.get("sector_topn", 3) if pool_key == "sector" else rc.get("broad_topn", 3)
-        topn = col[0].slider("持仓数", 1, 6, int(default_topn), key="etf_r_topn")
-        mom_l = col[1].slider("长动量", 20, 120, int(rc.get("mom_long", 60)), key="etf_r_moml")
-        mom_s = col[2].slider("短动量", 5, 40, int(rc.get("mom_short", 20)), key="etf_r_moms")
-        freq = col[3].select_slider("调仓频率", [1, 5, 10, 20], int(rc.get("rebalance_freq", 5)),
-                                    key="etf_r_freq")
-        if pool_key == "sector":
-            st.caption("💡 行业池默认开启**大盘择时开关**: 基准ETF(沪深300)均线下方连续确认后空仓避险。")
+        topn2 = col[0].slider("持仓数", 1, 6, int(topn), key="etf_r_topn")
+        mom_l2 = col[1].slider("长动量", 20, 120, mom_l, key="etf_r_moml")
+        mom_s2 = col[2].slider("短动量", 5, 40, mom_s, key="etf_r_moms")
+        freq2 = col[3].select_slider("调仓频率", [1, 5, 10, 20], int(rc.get("rebalance_freq", 5)), key="etf_r_freq")
 
         @st.cache_data(show_spinner="回测轮动...", ttl=600)
         def _bt_rot(pool_key, topn, mom_l, mom_s, freq):
             from strategy.etf import backtest_rotation
-            return backtest_rotation(cfg, pool=pool_key, topn=topn, mom_long=mom_l,
-                                     mom_short=mom_s, freq=freq)
-
+            return backtest_rotation(cfg, pool=pool_key, topn=topn, mom_long=mom_l, mom_short=mom_s, freq=freq)
         prefix = "宽基轮动" if pool_key == "broad" else "行业轮动"
-        _show_etf_backtest(_bt_rot(pool_key, topn, mom_l, mom_s, freq), "etf_rot", prefix)
+        _show_etf_backtest(_bt_rot(pool_key, topn2, mom_l2, mom_s2, freq2), "etf_rot", prefix)
 
-        st.subheader("本期轮动信号")
-        if st.button("🔄 生成最新信号", key="etf_r_sig", type="primary"):
-            with st.spinner("计算信号..."):
-                from strategy.etf import rotation_signal
-                st.session_state["etf_r_sig"] = rotation_signal(
-                    cfg, pool=pool_key, topn=topn, mom_long=mom_l, mom_short=mom_s)
-        sig = st.session_state.get("etf_r_sig")
-        if sig:
-            from strategy.etf import signal_to_markdown
-            st.markdown(signal_to_markdown(sig))
+
+def page_etf():
+    st.title("📊 ETF策略")
+    st.caption("场内宽基 · 给你操作建议(持有/卖出/观望 + 原因), 不只是回测")
+    cfg = get_cfg()
+    tab_trend, tab_rot = st.tabs(["📈 趋势择时", "🔄 动量轮动"])
+    with tab_trend:
+        _page_trend(cfg)
+    with tab_rot:
+        _page_rotation(cfg)
 
 
 # ============== 页面: 短线博弈 ==============
