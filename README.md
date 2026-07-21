@@ -96,10 +96,10 @@ python setup.py py2app
 
 **首次采集 ETF 数据**：
 ```bash
-# 全池近 6 年（注意：东财源连续批量请求易触发限流，失败的稍后重试即可）
+# 全池近 6 年（宽基走新浪指数源，稳定；黄金/行业走东财）
 python scripts/init_etf.py --years 6
 # 指定几只快速测试
-python scripts/init_etf.py --codes 510300,518880 --years 3
+python scripts/init_etf.py --codes 510300,588870 --years 3
 ```
 
 **命令行回测/信号**：
@@ -109,7 +109,7 @@ cfg=load_config(); bt=backtest_trend(cfg); \
 print(f'累计{bt[\"cum_ret\"]:+.1%} 回撤{bt[\"max_dd\"]:.1%} 换手{bt[\"turnover_annual\"]:.1f}x/年 {bt[\"n_trades\"]}笔')"
 ```
 
-数据存 `data/etf/<代码>.parquet`（独立于个股 `data/raw/`），前复权 OHLCV，全程用原始 6 位代码。
+数据存 `data/etf/<代码>.parquet`（独立于个股 `data/raw/`），OHLCV，全程用原始 6 位代码。**宽基走新浪指数源**（`stock_zh_index_daily`，稳定不限流，采对应指数代理 ETF）；黄金/行业走东财 `fund_etf_hist_em`。宽基→指数映射在 `config/etf_pool.yaml` 的 `index` 字段（如 510300→sh000300、588870→sh000688）。⚠️ 宽基 parquet 存的是**指数点位**（非 ETF 元价），趋势/动量信号通用（相关 >0.99），精确盈亏用交易软件查 ETF 实际价。
 
 ## 定时任务（macOS launchd）
 

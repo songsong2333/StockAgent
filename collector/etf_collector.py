@@ -46,13 +46,42 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_etf(code: str, start: str, end: str, adjust: str = "qfq",
-              max_retries: int = 3, sleep: float = 0.3) -> pd.DataFrame:
-    """拉取单只场内 ETF 日线, 返回标准化 DataFrame。code: 原始6位(如 510300)。
+def _fetch_sina_index(index_code: str, start: str, end: str,
+                      max_retries: int = 3, sleep: float = 0.3) -> pd.DataFrame:
+    """新浪指数源(稳定, 不限流): ak.stock_zh_index_daily。宽基ETF对应指数的代理采集。
 
-    数据源: ak.fund_etf_hist_em(东财)。空结果不重试(可能是代码错/退市)。
+    宽基指数与对应ETF走势>0.99相关, 趋势/动量信号通用; 返回的是指数点位(非ETF元价)。
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = ak.stock_zh_index_daily(symbol=index_code)
+            df = _normalize(df)
+            if not df.empty:
+                df = df[(df["date"] >= pd.Timestamp(start)) & (df["date"] <= pd.Timestamp(end))]
+                time.sleep(sleep)
+                return df.reset_index(drop=True)
+            break
+        except Exception as e:
+            log.debug(f"{index_code}(新浪指数) 第{attempt}次失败: {e}")
+            time.sleep(sleep * attempt)
+    return pd.DataFrame()
+
+
+def fetch_etf(code: str, start: str, end: str, adjust: str = "qfq",
+              max_retries: int = 3, sleep: float = 0.3,
+              index_code: Optional[str] = None) -> pd.DataFrame:
+    """拉取单只 ETF/指数日线, 返回标准化 DataFrame。code: 原始6位(如 510300)。
+
+    数据源优先级: 有 index_code 时用新浪指数源(稳定不限流, 代理宽基ETF); 否则东财
+    fund_etf_hist_em(黄金/行业, 易限流)。新浪失败时回退东财。
     """
     code = str(code).strip().zfill(6)
+    if index_code:                      # 优先新浪指数源(宽基ETF的稳定通道)
+        df = _fetch_sina_index(index_code, start, end, max_retries, sleep)
+        if not df.empty:
+            return df
+        log.info(f"{code} 新浪指数({index_code})失败, 回退东财")
+    # 东财 fund_etf_hist_em(行业/黄金 或 新浪失败时)
     adjust = adjust or ""
     for attempt in range(1, max_retries + 1):
         try:
@@ -73,12 +102,13 @@ def fetch_etf(code: str, start: str, end: str, adjust: str = "qfq",
             wait = (3.0 if throttled else sleep) * (2 ** (attempt - 1))
             log.debug(f"{code}(ETF) 第{attempt}次失败({'限流,长等待' if throttled else '异常'} {wait:.0f}s): {e}")
             time.sleep(wait)
-    log.warning(f"{code} ETF 采集失败({max_retries}次)")
+    log.warning(f"{code} 采集失败(新浪指数/东财 均失败)")
     return pd.DataFrame()
 
 
 def update_one(code: str, etf_dir: Union[str, Path], start: str, end: str,
-               adjust: str, max_retries: int, sleep: float) -> bool:
+               adjust: str, max_retries: int, sleep: float,
+               index_code: Optional[str] = None) -> bool:
     """增量更新单只 ETF: 读取已有 parquet, 仅拉最后日期之后的新数据。"""
     code = str(code).strip().zfill(6)
     path = _etf_path(etf_dir, code)
@@ -96,7 +126,7 @@ def update_one(code: str, etf_dir: Union[str, Path], start: str, end: str,
         old = pd.DataFrame()
         fetch_start = start
 
-    new = fetch_etf(code, fetch_start, end, adjust, max_retries, sleep)
+    new = fetch_etf(code, fetch_start, end, adjust, max_retries, sleep, index_code=index_code)
     if new.empty and old.empty:
         return False
     combined = pd.concat([old, new], ignore_index=True) if not new.empty else old
@@ -150,12 +180,20 @@ def update_all(cfg: dict, codes: Optional[List[str]] = None,
 
     if codes is None:
         codes = pool_codes(cfg)
+    # 从标的池建 code→index 映射(有映射的走新浪指数源, 避开东财限流)
+    pool = load_etf_pool(cfg)
+    idx_map = {}
+    for grp in ("broad", "sector"):
+        for it in pool.get(grp, []) or []:
+            if it.get("index"):
+                idx_map[str(it["code"]).strip().zfill(6)] = it["index"]
 
     ok, failed = 0, []
     for code in tqdm(codes, desc="采集ETF"):
         try:
             if update_one(code, etf_dir, start, end, adjust,
-                          cc["max_retries"], cc["request_sleep"]):
+                          cc["max_retries"], cc["request_sleep"],
+                          index_code=idx_map.get(code)):
                 ok += 1
             else:
                 failed.append(code)
