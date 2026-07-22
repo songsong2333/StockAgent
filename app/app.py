@@ -822,6 +822,41 @@ def _save_etf_holdings(holdings: dict):
                  encoding="utf-8")
 
 
+@st.cache_data(show_spinner="获取ETF实时行情...", ttl=300)
+def _etf_spot_map() -> dict:
+    """全市场ETF实时行情 → {code: {name, last_px}}。缓存5分钟(fund_etf_spot_em 不限流,
+    返回的是ETF真实元价, 可算真实盈亏)。"""
+    import akshare as ak
+    df = ak.fund_etf_spot_em()
+    m = {}
+    for _, r in df.iterrows():
+        code = str(r["代码"]).strip().zfill(6)
+        px = r.get("最新价")
+        m[code] = {"name": str(r.get("名称", code)),
+                   "last_px": float(px) if pd.notna(px) else None}
+    return m
+
+
+def _enrich_with_spot(holdings: dict) -> tuple:
+    """用ETF实时行情补全/刷新每只持仓的 name + last_px, 并校验代码。
+    返回 (holdings, invalid_codes)。spot 拉取失败则保留原值(不阻断)。"""
+    try:
+        spot = _etf_spot_map()
+    except Exception as e:
+        st.warning(f"实时行情获取失败({e}), 名称/最新价沿用上次保存值")
+        return holdings, []
+    invalid = []
+    for code, h in holdings.items():
+        info = spot.get(code)
+        if info is None:
+            invalid.append(code)
+            continue
+        h["name"] = info["name"]
+        if info["last_px"] is not None:
+            h["last_px"] = info["last_px"]
+    return holdings, invalid
+
+
 def _trend_advice(status: Optional[dict], bench_bull: bool) -> tuple:
     """根据单标趋势状态 + 大盘, 生成(动作, 人话原因)。status: single_etf_status 返回。"""
     if not status:
@@ -909,26 +944,32 @@ def _page_trend(cfg):
     # 1. 我的持仓与操作建议 (决策核心)
     st.subheader("💼 我的持仓与操作建议")
     holdings = _load_etf_holdings()
+    holdings, invalid = _enrich_with_spot(holdings)   # 自动补全名称+最新价, 校验代码
+    if invalid:
+        st.warning(f"⚠️ 以下代码在行情中未找到(可能无效/未上市), 请核对: {invalid}")
     edit_df = pd.DataFrame(
-        [{"代码": c, "名称": h.get("name", c), "数量": h.get("shares", 0),
+        [{"代码": c, "名称": h.get("name") or c, "数量": h.get("shares", 0),
           "成本": h.get("cost", 0.0), "最新现价": h.get("last_px")}
          for c, h in holdings.items()],
         columns=["代码", "名称", "数量", "成本", "最新现价"])
     edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True,
                             key="etf_holdings_editor")
-    if st.button("💾 保存持仓并刷新建议", key="etf_save_h", type="primary"):
+    if st.button("💾 保存并自动补全名称/最新价", key="etf_save_h", type="primary"):
         new_h = {}
         for _, r in edited.iterrows():
             code = str(r.get("代码", "")).strip().zfill(6)
             if not code or code == "000000":
                 continue
-            lpx = r.get("最新现价")
             new_h[code] = {"name": str(r.get("名称", code)),
                            "shares": int(r.get("数量", 0) or 0),
                            "cost": float(r.get("成本", 0) or 0),
-                           "last_px": float(lpx) if pd.notna(lpx) else None}
+                           "last_px": None}
+        new_h, invalid2 = _enrich_with_spot(new_h)   # 保存时再补全一次(确保最新)
         _save_etf_holdings(new_h)
-        st.success("持仓已保存, 正在刷新建议...")
+        if invalid2:
+            st.warning(f"已保存, 但以下代码未在行情中找到, 请核对: {invalid2}")
+        else:
+            st.success("持仓已保存, 名称/最新价已自动补全")
         st.rerun()
 
     if holdings:
@@ -940,12 +981,12 @@ def _page_trend(cfg):
             pnl = (lpx / cost - 1) if (lpx and cost) else None
             rows.append({"名称": h.get("name", code), "代码": code, "数量": h.get("shares", 0),
                          "成本": cost, "最新现价": lpx if lpx else "—",
-                         "浮盈": f"{pnl:+.1%}" if pnl is not None else "填现价/查交易软件",
+                         "浮盈": f"{pnl:+.1%}" if pnl is not None else "无现价",
                          "操作": action, "原因": reason})
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        st.caption("💡 操作建议基于双均线趋势信号(宽基数据为指数点位, 信号通用); 浮盈需填『最新现价』(交易软件查)。")
+        st.caption("💡 名称/最新价自动从实时行情补全(缓存5分钟); 操作建议基于双均线趋势信号; 浮盈=最新现价/成本-1。")
     else:
-        st.info("还没有持仓。点上方表格右下 ➕ 添加(代码/名称/数量/成本), 保存后即出操作建议。")
+        st.info("还没有持仓。点上方表格右下 ➕ 添加(只需填代码/数量/成本), 保存后自动补全名称和最新价。")
 
     st.divider()
 
