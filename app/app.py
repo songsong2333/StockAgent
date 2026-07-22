@@ -857,10 +857,62 @@ def _enrich_with_spot(holdings: dict) -> tuple:
     return holdings, invalid
 
 
+# 名称 → 对应宽基指数(新浪源稳定采集); 覆盖各基金公司的沪深300/500/1000/创业板/科创50/上证50
+_NAME_INDEX_HINTS = [
+    ("沪深300", "sh000300"), ("中证500", "sh000905"), ("中证1000", "sh000852"),
+    ("创业板", "sz399006"), ("科创50", "sh000688"), ("上证50", "sh000016"),
+]
+
+
+def _guess_index_by_name(name: str) -> Optional[str]:
+    """根据ETF名称猜对应宽基指数代码(用于池外ETF走新浪指数源采集)。"""
+    for kw, idx in _NAME_INDEX_HINTS:
+        if kw in str(name):
+            return idx
+    return None
+
+
+def _ensure_collected(holdings: dict, cfg: dict) -> dict:
+    """确保每只持仓ETF有历史数据(parquet); 没有则采集(有指数映射/名称匹配走新浪稳定源, 否则东财)。
+    返回 {code: 状态文案}。"""
+    from collector.etf_collector import update_one, load_etf_pool
+    etf_dir = ROOT / cfg["paths"].get("etf_dir", "data/etf")
+    end = pd.Timestamp.now().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.now() - pd.DateOffset(years=6)).strftime("%Y-%m-%d")
+    cc = cfg["collector"]
+    adjust = cc.get("adjust", "qfq"); retries = cc.get("max_retries", 3); sleep = cc.get("request_sleep", 0.8)
+    idx_map = {}
+    try:
+        pool = load_etf_pool(cfg)
+        for grp in ("broad", "sector"):
+            for it in pool.get(grp, []) or []:
+                if it.get("index"):
+                    idx_map[str(it["code"]).strip().zfill(6)] = it["index"]
+    except Exception:
+        pass
+    spot = {}
+    try:
+        spot = _etf_spot_map()
+    except Exception:
+        pass
+    results = {}
+    for code in holdings:
+        if (etf_dir / f"{code}.parquet").exists():
+            results[code] = "已有数据"
+            continue
+        idx = idx_map.get(code) or _guess_index_by_name(spot.get(code, {}).get("name", ""))
+        try:
+            ok = update_one(code, etf_dir, start, end, adjust, retries, sleep, index_code=idx)
+            results[code] = "采集成功" if ok else "采集失败(东财限流/代码无效)"
+        except Exception:
+            results[code] = "采集异常"
+    return results
+
+
 def _trend_advice(status: Optional[dict], bench_bull: bool) -> tuple:
     """根据单标趋势状态 + 大盘, 生成(动作, 人话原因)。status: single_etf_status 返回。"""
     if not status:
-        return ("❓ 无数据", "该ETF未采集, 先运行 scripts/init_etf.py")
+        return ("❓ 未采集", "点上方『保存』按钮自动采集历史数据后出趋势信号")
     hold, raw, band, px = status["hold"], status["raw"], status["band%"], status["close"]
     if hold == 1:
         action = "✅ 持有"
@@ -954,7 +1006,7 @@ def _page_trend(cfg):
         columns=["代码", "名称", "数量", "成本", "最新现价"])
     edited = st.data_editor(edit_df, num_rows="dynamic", use_container_width=True,
                             key="etf_holdings_editor")
-    if st.button("💾 保存并自动补全名称/最新价", key="etf_save_h", type="primary"):
+    if st.button("💾 保存(补全名称/最新价 + 采集历史)", key="etf_save_h", type="primary"):
         new_h = {}
         for _, r in edited.iterrows():
             code = str(r.get("代码", "")).strip().zfill(6)
@@ -964,12 +1016,20 @@ def _page_trend(cfg):
                            "shares": int(r.get("数量", 0) or 0),
                            "cost": float(r.get("成本", 0) or 0),
                            "last_px": None}
-        new_h, invalid2 = _enrich_with_spot(new_h)   # 保存时再补全一次(确保最新)
+        new_h, invalid2 = _enrich_with_spot(new_h)   # 补名称+最新价
+        with st.spinner("采集持仓ETF历史数据(首次较慢, 宽基走新浪秒级)..."):
+            collect_res = _ensure_collected(new_h, cfg)   # 采集历史
         _save_etf_holdings(new_h)
+        failed = [c for c, s in collect_res.items() if "失败" in s or "异常" in s]
+        msg = []
         if invalid2:
-            st.warning(f"已保存, 但以下代码未在行情中找到, 请核对: {invalid2}")
+            msg.append(f"代码未找到请核对: {invalid2}")
+        if failed:
+            msg.append(f"采集失败(趋势信号暂不可用, 多为东财限流): {failed}")
+        if msg:
+            st.warning("；".join(msg))
         else:
-            st.success("持仓已保存, 名称/最新价已自动补全")
+            st.success("持仓已保存: 名称/最新价已补全, 历史数据已采集, 趋势信号就绪")
         st.rerun()
 
     if holdings:
