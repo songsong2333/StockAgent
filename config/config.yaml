@@ -66,6 +66,13 @@ etf:
     w_mom: 0.4
     w_flow: 0.3
     w_heat: 0.3
+  multifactor:                       # 方向②: 多因子综合评分权重(broad池无sector→w_flow转w_mom)
+    w_trend: 0.25
+    w_mom: 0.25
+    w_flow: 0.20
+    w_rs: 0.15                       # 相对强度(vs基准60日超额)
+    w_vol: 0.15                      # 波动率反向(低波优先)
+    topn: 5
 
 # ---------------- 因子与模型 ----------------
 model:

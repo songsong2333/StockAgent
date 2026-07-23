@@ -638,6 +638,89 @@ def backtest_rotation_flow(cfg: dict, topn: Optional[int] = None,
     return backtest_rotation(cfg, pool="sector", topn=topn, freq=freq, start=start, capital=capital)
 
 
+def multifactor_signal(cfg: dict, pool: str = "sector",
+                       w_trend: float = 0.25, w_mom: float = 0.25, w_flow: float = 0.20,
+                       w_rs: float = 0.15, w_vol: float = 0.15,
+                       topn: Optional[int] = None) -> dict:
+    """方向②: 多因子综合评分(替代单一 MA60)。trend/mom/flow/rs/vol 五因子横截面 rank 加权。
+
+    - trend: 多头排列打分 0-3 (px>MA20 +1, MA20>MA60 +1, MA60>MA120 +1)
+    - mom: 60日收益/60日波动(风险调整动量)
+    - flow: 行业资金流净额(sector池, broad池权重转mom)
+    - rs: 相对强度(vs 基准 60日超额)
+    - vol_rev: 波动率反向(低波优先)
+    权重和≠1 则归一化。返回 candidates(各因子+multifactor_score)/top/weights。
+    """
+    ec = cfg.get("etf", {}); rc = ec.get("rotation", {}); mf = ec.get("multifactor", {})
+    w_trend = mf.get("w_trend", w_trend); w_mom = mf.get("w_mom", w_mom); w_flow = mf.get("w_flow", w_flow)
+    w_rs = mf.get("w_rs", w_rs); w_vol = mf.get("w_vol", w_vol)
+    if topn is None:
+        topn = mf.get("topn", rc.get("sector_topn" if pool == "sector" else "broad_topn", 3))
+    if pool == "broad":                      # broad 池无 sector 字段, flow 权重转 mom
+        w_mom += w_flow; w_flow = 0.0
+    close, open_px, ret, names, bench = load_etf_panel(cfg, pool)
+    bench_code = str(ec.get("benchmark_etf", "510300")).strip().zfill(6)
+    codes = [c for c in close.columns if c != bench_code]
+    last = close.index[-1]
+    px = close[codes].iloc[-1]
+    ma20 = close[codes].rolling(20).mean().iloc[-1]
+    ma60 = close[codes].rolling(60).mean().iloc[-1]
+    ma120 = close[codes].rolling(120).mean().iloc[-1]
+    mom_l = (close[codes] / close[codes].shift(60) - 1).iloc[-1]
+    vol60 = ret[codes].rolling(60).std().iloc[-1]
+    bench_ret60 = bench.pct_change(60).iloc[-1]
+    bench_ret60 = bench_ret60 if pd.notna(bench_ret60) else 0.0
+    trend = ((px > ma20).astype(int).fillna(0)
+             + (ma20 > ma60).astype(int).fillna(0)
+             + (ma60 > ma120).astype(int).fillna(0))
+    mom = (mom_l / vol60).replace([np.inf, -np.inf], 0).fillna(0)
+    rs = (mom_l - bench_ret60).fillna(0)
+    vol_rev = (-vol60).fillna(0)
+    flow = pd.Series(0.0, index=codes)
+    if pool == "sector" and w_flow > 0:
+        sc = _build_sector_scores(codes, names, cfg)
+        flow = sc.set_index("code")["flow_net"].reindex(codes).fillna(0.0)
+    rows = []
+    for c in codes:
+        rows.append({"code": c, "name": names.get(c, c),
+                     "close": round(float(px[c]), 3) if pd.notna(px[c]) else None,
+                     "trend": int(trend[c]) if pd.notna(trend[c]) else 0,
+                     "mom": round(float(mom[c]), 3), "rs": round(float(rs[c]), 3),
+                     "vol_rev": round(float(vol_rev[c]), 4), "flow": float(flow[c])})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {"strategy": "multifactor", "pool": pool, "date": last.strftime("%Y-%m-%d"),
+                "candidates": df, "top": df, "weights": {}}
+    for f in ("trend", "mom", "rs", "vol_rev", "flow"):
+        df[f + "_rank"] = df[f].rank(pct=True).fillna(0.5)
+    wt = (w_trend + w_mom + w_flow + w_rs + w_vol) or 1.0
+    df["multifactor_score"] = ((w_trend * df["trend_rank"] + w_mom * df["mom_rank"]
+                                + w_flow * df["flow_rank"] + w_rs * df["rs_rank"]
+                                + w_vol * df["vol_rev_rank"]) / wt).round(3)
+    df["uptrend"] = df["code"].map(lambda c: bool(ma20[c] > ma60[c])
+                                   if pd.notna(ma20[c]) and pd.notna(ma60[c]) else False)
+    cand = df[df["uptrend"]].sort_values("multifactor_score", ascending=False)
+    top = cand.head(topn)
+    return {"strategy": "multifactor", "pool": pool, "date": last.strftime("%Y-%m-%d"),
+            "candidates": cand.reset_index(drop=True), "top": top.reset_index(drop=True),
+            "weights": {"w_trend": round(w_trend / wt, 2), "w_mom": round(w_mom / wt, 2),
+                        "w_flow": round(w_flow / wt, 2), "w_rs": round(w_rs / wt, 2),
+                        "w_vol": round(w_vol / wt, 2)}}
+
+
+def backtest_multifactor(cfg: dict, pool: str = "sector", topn: Optional[int] = None,
+                         start: Optional[str] = None, capital: Optional[float] = None,
+                         freq: Optional[int] = None) -> dict:
+    """方向②回测。trend/mom/rs/vol 历史可算(价格衍生), flow 不可得(权重转 mom)。
+    简化: 复用 backtest_rotation 动量骨架验证; 完整多因子评分见 multifactor_signal(当前信号)。"""
+    rc = cfg.get("etf", {}).get("rotation", {})
+    if topn is None:
+        topn = rc.get("sector_topn" if pool == "sector" else "broad_topn", 3)
+    if freq is None:
+        freq = rc.get("rebalance_freq", 5)
+    return backtest_rotation(cfg, pool=pool, topn=topn, freq=freq, start=start, capital=capital)
+
+
 # ============== Markdown 输出 ==============
 def signal_to_markdown(sig: dict) -> str:
     if sig["strategy"] == "trend":
