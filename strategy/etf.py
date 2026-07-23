@@ -585,6 +585,59 @@ def rotation_signal(cfg: dict, pool: str = "broad", topn: Optional[int] = None,
             "candidates": cand, "top": top}
 
 
+def rotation_signal_flow(cfg: dict, topn: Optional[int] = None,
+                         w_mom: float = 0.4, w_flow: float = 0.3, w_heat: float = 0.3,
+                         market_timing: Optional[bool] = None) -> dict:
+    """方向①: 资金流+题材热度增强的行业ETF轮动信号(sector池)。
+
+    动量 + 行业资金流净额 + 题材热度, 横截面 rank(pct=True) 加权。东财限流时 flow/heat
+    自动降级(权重转移动量), 即退化为纯动量轮动。返回 rotation_signal 同构 + total_score 列
+    + weights/data_status。
+    """
+    ec = cfg.get("etf", {}); rc = ec.get("rotation", {}); rfc = ec.get("rotation_flow", {})
+    w_mom = rfc.get("w_mom", w_mom); w_flow = rfc.get("w_flow", w_flow); w_heat = rfc.get("w_heat", w_heat)
+    if topn is None:
+        topn = rc.get("sector_topn", 3)
+    if market_timing is None:
+        market_timing = rc.get("sector_market_timing", True)
+    base = rotation_signal(cfg, pool="sector", topn=topn, market_timing=market_timing)
+    cand = base["candidates"].copy()
+    if cand.empty:
+        base.update({"strategy": "rotation_flow", "weights": {"w_mom": 1.0, "w_flow": 0, "w_heat": 0},
+                     "data_status": {"flow": False, "heat": False}})
+        return base
+    sc = _build_sector_scores(cand["code"].tolist(), dict(zip(cand["code"], cand["name"])), cfg)
+    cand = cand.merge(sc[["code", "flow_net", "heat_score"]], on="code", how="left")
+    # 横截面 rank; 数据缺失填0.5中性, 权重转移给可用项(东财限流时退化为纯动量)
+    has_flow = bool(cand["flow_net"].notna().any())
+    has_heat = bool(cand["heat_score"].notna().any())
+    wm, wf, wh = w_mom, (w_flow if has_flow else 0.0), (w_heat if has_heat else 0.0)
+    if not has_flow: wm += w_flow
+    if not has_heat: wm += w_heat
+    cand["flow_rank"] = cand["flow_net"].rank(pct=True).fillna(0.5)
+    cand["heat_rank"] = cand["heat_score"].rank(pct=True).fillna(0.5)
+    cand["mom_rank"] = cand["score"].rank(pct=True).fillna(0.5)
+    s = (wm + wf + wh) or 1.0
+    cand["total_score"] = ((wm * cand["mom_rank"] + wf * cand["flow_rank"] + wh * cand["heat_rank"]) / s).round(3)
+    cand = cand.sort_values("total_score", ascending=False).reset_index(drop=True)
+    top = cand.head(topn).copy() if base["market_bull"] else cand.iloc[0:0].copy()
+    base.update({"strategy": "rotation_flow", "candidates": cand, "top": top,
+                 "weights": {"w_mom": round(wm / s, 2), "w_flow": round(wf / s, 2), "w_heat": round(wh / s, 2)},
+                 "data_status": {"flow": has_flow, "heat": has_heat}})
+    return base
+
+
+def backtest_rotation_flow(cfg: dict, topn: Optional[int] = None,
+                           start: Optional[str] = None, capital: Optional[float] = None,
+                           freq: Optional[int] = None) -> dict:
+    """方向①回测。⚠️ 历史行业资金流/题材热度不可得(akshare 只给当日), 回测只能验证
+    动量骨架; flow/heat 增强仅在当前实时信号(rotation_signal_flow)有效。复用 backtest_rotation。"""
+    rc = cfg.get("etf", {}).get("rotation", {})
+    if topn is None: topn = rc.get("sector_topn", 3)
+    if freq is None: freq = rc.get("rebalance_freq", 5)
+    return backtest_rotation(cfg, pool="sector", topn=topn, freq=freq, start=start, capital=capital)
+
+
 # ============== Markdown 输出 ==============
 def signal_to_markdown(sig: dict) -> str:
     if sig["strategy"] == "trend":

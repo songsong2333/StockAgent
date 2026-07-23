@@ -62,6 +62,10 @@ etf:
     sector_market_timing: true      # 行业池叠大盘择时开关(空头空仓避险)
     bench_ma: 60                    # 大盘MA窗口
     rebalance_freq: 5
+  rotation_flow:                     # 方向①: 资金流+题材热度行业轮动权重(东财限流时自动转纯动量)
+    w_mom: 0.4
+    w_flow: 0.3
+    w_heat: 0.3
 
 # ---------------- 因子与模型 ----------------
 model:
