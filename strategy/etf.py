@@ -721,6 +721,50 @@ def backtest_multifactor(cfg: dict, pool: str = "sector", topn: Optional[int] = 
     return backtest_rotation(cfg, pool=pool, topn=topn, freq=freq, start=start, capital=capital)
 
 
+def sentiment_timing(cfg: dict) -> dict:
+    """方向③: 市场情绪择时。用情绪温度计(temp/炸板率/跌停) + 融资余额, 给状态 + 仓位上限。
+
+    叠加在 bench_bull 之上(不替换): bench_bull=False → 硬空仓; True 但情绪过热 → 软减仓。
+    返回 {state: 过热/偏热/正常/恐慌, position_cap: 0~1, temp, zha_rate, n_dt, margin_total, reason}。
+    """
+    from collector.flow_collector import market_sentiment_snap, margin_balance
+    ec = cfg.get("etf", {}); sc = ec.get("sentiment", {})
+    if not sc.get("enabled", True):
+        return {"state": "正常", "position_cap": 1.0, "temp": None, "reason": "情绪择时未启用"}
+    sent = market_sentiment_snap()
+    marg = margin_balance()
+    temp = sent.get("temp", 50); zha = sent.get("zha_rate", 0); n_dt = sent.get("n_dt", 0)
+    hot_temp = sc.get("hot_temp", 75); panic_temp = sc.get("panic_temp", 25)
+    panic_dt = sc.get("panic_dt", 100); hot_zha = sc.get("hot_zha", 0.4)
+    state, cap, reason = "正常", 1.0, "情绪正常, 按策略满仓"
+    if temp <= panic_temp or n_dt >= panic_dt:                     # 恐慌优先
+        state, cap = "恐慌", 0.0
+        why = f"temp={temp}≤{panic_temp}" if temp <= panic_temp else f"跌停{n_dt}≥{panic_dt}"
+        reason = f"情绪冰点({why}), 系统性风险, 空仓避险"
+    elif temp >= hot_temp and zha >= hot_zha:                      # 过热(涨停多+炸板率飙)
+        state, cap = "过热", 0.3
+        reason = f"情绪过热(temp={temp}≥{hot_temp} 且 炸板率{zha:.0%}≥{hot_zha:.0%}), 龙头见顶信号, 减仓到30%"
+    elif temp >= hot_temp - 10:                                    # 偏热
+        state, cap = "偏热", 0.5
+        reason = f"情绪偏热(temp={temp}), 接近高潮, 控制仓位到50%"
+    return {"state": state, "position_cap": cap, "temp": temp, "zha_rate": zha,
+            "n_dt": n_dt, "n_zt": sent.get("n_zt"), "margin_total": marg.get("total"),
+            "reason": reason, "advice": sent.get("advice", ""), "date": sent.get("date")}
+
+
+def apply_sentiment_cap(signal_dict: dict, timing_dict: dict) -> dict:
+    """把 sentiment_timing 的仓位上限叠加到任意信号(趋势/轮动/多因子)的 top 上。
+    cap<1 时按比例缩减 top 数量(topn=5,cap=0.5→取top2); cap=0→空仓。"""
+    cap = timing_dict.get("position_cap", 1.0)
+    top = signal_dict.get("top")
+    signal_dict["sentiment"] = timing_dict
+    if cap >= 1.0 or top is None or top.empty:
+        return signal_dict
+    n_keep = max(1, int(len(top) * cap)) if cap > 0 else 0
+    signal_dict["top"] = top.head(n_keep).copy()
+    return signal_dict
+
+
 # ============== Markdown 输出 ==============
 def signal_to_markdown(sig: dict) -> str:
     if sig["strategy"] == "trend":
