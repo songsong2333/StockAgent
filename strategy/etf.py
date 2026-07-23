@@ -409,6 +409,91 @@ def single_etf_status(code: str, cfg: dict, ma_short: Optional[int] = None,
     }
 
 
+# ============== 行业 ETF ↔ 行业/题材映射 (资金流/题材轮动共用) ==============
+_SECTOR_KEYWORDS = {
+    "半导体": ["半导体", "芯片", "集成电路", "光刻", "封装", "元件"],
+    "新能源": ["新能源", "锂电", "光伏", "风电", "储能", "电动车", "电力设备", "电池", "碳中和"],
+    "消费": ["消费", "食品饮料", "白酒", "家电", "零售", "免税", "商贸", "纺织"],
+    "金融": ["银行", "证券", "保险", "金融", "多元金融"],
+    "医药": ["医药", "医疗", "生物", "创新药", "CRO", "中药", "疫苗"],
+    "军工": ["军工", "国防", "航天", "兵器", "航空"],
+}
+# ETF name → sector 反推(池外 ETF 用)
+_NAME_SECTOR_HINTS = [
+    ("半导体|芯片", "半导体"), ("电池|光伏|新能源|锂电", "新能源"),
+    ("消费|食品|白酒|家电", "消费"), ("银行|证券|保险|金融", "金融"),
+    ("医药|医疗|生物", "医药"), ("军工|国防|航天", "军工"),
+]
+
+
+def _sector_of(code: str, name: str, cfg: dict) -> str:
+    """ETF 的 sector: 优先 pool 的 sector 字段, 否则从 name 反推。"""
+    code = str(code).strip().zfill(6)
+    try:
+        from collector.etf_collector import load_etf_pool
+        pool = load_etf_pool(cfg)
+        for grp in ("broad", "sector"):
+            for it in pool.get(grp, []) or []:
+                if str(it.get("code", "")).strip().zfill(6) == code:
+                    return it.get("sector") or ""
+    except Exception:
+        pass
+    import re
+    for pat, sec in _NAME_SECTOR_HINTS:
+        if re.search(pat, str(name)):
+            return sec
+    return ""
+
+
+def _match_sector_to_flow(sector: str, flow_df: pd.DataFrame) -> Optional[pd.Series]:
+    """ETF sector → 匹配行业资金流行(关键词命中; 多命中取净额最大)。无命中返回 None。"""
+    if not sector or flow_df is None or flow_df.empty or "sector" not in flow_df.columns:
+        return None
+    kws = _SECTOR_KEYWORDS.get(sector, [sector])
+    mask = flow_df["sector"].astype(str).str.contains("|".join(kws), na=False, regex=True)
+    hit = flow_df[mask]
+    if hit.empty:
+        return None
+    if "net_amount" in hit.columns:
+        hit = hit.sort_values("net_amount", ascending=False)
+    return hit.iloc[0]
+
+
+def _match_sector_to_concept(sector: str, heat_df: pd.DataFrame) -> float:
+    """ETF sector → 题材热度分(命中题材中最热的)。无命中返回 NaN。"""
+    if (not sector or heat_df is None or heat_df.empty
+            or "concept" not in heat_df.columns or "heat_score" not in heat_df.columns):
+        return np.nan
+    kws = _SECTOR_KEYWORDS.get(sector, [sector])
+    mask = heat_df["concept"].astype(str).str.contains("|".join(kws), na=False, regex=True)
+    hit = heat_df[mask]
+    if hit.empty:
+        return np.nan
+    return float(pd.to_numeric(hit["heat_score"], errors="coerce").max())
+
+
+def _build_sector_scores(etf_codes: list, names: dict, cfg: dict) -> pd.DataFrame:
+    """资金流/题材轮动共用入口: 给一批 ETF code, 返回
+    DataFrame(code/name/sector/flow_net/flow_pct/heat_score), 数据失败列 NaN。"""
+    from collector.flow_collector import sector_fund_flow, concept_heat
+    flow_df = sector_fund_flow()
+    heat_df = concept_heat(topn=60)
+    rows = []
+    for code in etf_codes:
+        code = str(code).strip().zfill(6)
+        name = names.get(code, code)
+        sector = _sector_of(code, name, cfg)
+        fr = _match_sector_to_flow(sector, flow_df)
+        hs = _match_sector_to_concept(sector, heat_df)
+        rows.append({
+            "code": code, "name": name, "sector": sector,
+            "flow_net": float(fr["net_amount"]) if fr is not None and pd.notna(fr.get("net_amount")) else np.nan,
+            "flow_pct": float(fr["net_pct"]) if fr is not None and pd.notna(fr.get("net_pct")) else np.nan,
+            "heat_score": hs if not (isinstance(hs, float) and np.isnan(hs)) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
 def trend_signal(cfg: dict, ma_short: Optional[int] = None, ma_long: Optional[int] = None,
                  confirm_days: Optional[int] = None, band_filter: Optional[float] = None,
                  pool: str = "broad") -> dict:
