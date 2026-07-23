@@ -971,7 +971,7 @@ def _show_etf_backtest(bt: dict, daily_key: str, prefix: str, exposure_target: f
     fig.add_trace(go.Scatter(x=dts, y=bench["curve"], name=f"基准(回撤{bench['max_dd']:.0%})",
                              line=dict(color="#3498db")))
     fig.update_layout(height=380, hovermode="x unified", template="plotly_white", yaxis_title="净值")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key=f"{daily_key}_chart")
     with st.expander(f"📋 历史交易明细 ({bt['n_trades']}笔, 总佣金{bt['total_commission']:.0f}元) — 仅回测参考, 非实盘"):
         tl = bt["trade_log"]
         if not tl.empty:
@@ -1158,15 +1158,120 @@ def _page_rotation(cfg):
         _show_etf_backtest(_bt_rot(pool_key, topn2, mom_l2, mom_s2, freq2), "etf_rot", prefix)
 
 
+def _page_smart(cfg):
+    """🧠 智能策略: 多因子/资金流题材轮动 + 情绪择时, 决策优先布局。"""
+    from strategy.etf import (multifactor_signal, rotation_signal_flow,
+                              sentiment_timing, apply_sentiment_cap)
+    from collector.flow_collector import sector_fund_flow, concept_heat
+
+    timing = sentiment_timing(cfg)
+    # 1. 本期建议持有 (决策核心)
+    st.subheader("🎯 本期建议持有 (多因子 + 资金流/题材 + 情绪择时)")
+    pool_label = st.radio("标的池", ["broad 宽基(多因子)", "sector 行业(资金流+题材增强)"],
+                          horizontal=True, key="etf_s_pool")
+    pk = "broad" if pool_label.startswith("broad") else "sector"
+    if pk == "sector":
+        sig = rotation_signal_flow(cfg); strat = "资金流+题材轮动"
+    else:
+        sig = multifactor_signal(cfg, pool="broad"); strat = "多因子"
+    sig = apply_sentiment_cap(sig, timing)
+    cap, state = timing["position_cap"], timing["state"]
+    emoji = {"恐慌": "🧊", "过热": "🔥", "偏热": "🥵", "正常": "😊"}.get(state, "")
+    if cap == 0:
+        st.warning(f"{emoji} 市场情绪{state} → 本期**空仓避险**（{timing['reason']}）")
+    elif cap < 1:
+        st.info(f"{emoji} 市场情绪{state}（仓位上限 {cap:.0%}）→ {timing['reason']}")
+    top = sig["top"]
+    if top.empty:
+        st.info(f"本期无符合条件标的（趋势+{strat}）→ 空仓观望")
+    else:
+        rows = []
+        for _, r in top.iterrows():
+            score = r.get("multifactor_score", r.get("total_score", 0))
+            reason = (_rotation_reason(r) if "mom_long" in r
+                      else f"综合分{score:.2f}(趋势{r.get('trend','?')}/动量{r.get('mom','?')})")
+            rows.append({"名称": r["name"], "代码": r["code"], "现价": r.get("close"),
+                         "综合分": score, "为什么选它": reason})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.caption(f"策略={strat}; 情绪仓位上限={cap:.0%}（已按比例裁减持仓数）")
+    holdings = _load_etf_holdings()
+    if holdings:
+        top_codes = set(top["code"].tolist()) if not top.empty else set()
+        hr = [{"名称": h.get("name", c), "代码": c,
+               "建议": "✅ 在推荐池" if c in top_codes else "⚠️ 不在推荐池, 考虑换出"}
+              for c, h in holdings.items()]
+        st.dataframe(pd.DataFrame(hr), use_container_width=True, hide_index=True)
+
+    st.divider()
+    # 2. 市场情绪温度计
+    st.subheader("🌡️ 市场情绪温度计")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("情绪温度", f"{timing.get('temp', '?')}/100", state)
+    c2.metric("涨停", timing.get("n_zt", "?"), f"跌停 {timing.get('n_dt', '?')}")
+    c3.metric("炸板率", f"{timing.get('zha_rate', 0):.0%}")
+    c4.metric("融资余额", f"{timing.get('margin_total', 0):.0f}亿")
+    st.caption(f"💡 {timing.get('advice', '')}")
+
+    st.divider()
+    # 3. 行业资金流 + 题材热度 (并排)
+    st.subheader("💰 行业资金流 + 🔥 题材热度")
+    col1, col2 = st.columns(2)
+    with col1:
+        ff = sector_fund_flow()
+        if not ff.empty:
+            st.markdown("**主力净流入 Top5**")
+            st.dataframe(ff.head(5)[["sector", "net_amount", "pct_chg"]].rename(
+                columns={"sector": "行业", "net_amount": "净额(元)", "pct_chg": "涨跌幅"}),
+                use_container_width=True, hide_index=True)
+            st.markdown("**主力净流出 Top5**")
+            st.dataframe(ff.tail(5)[["sector", "net_amount", "pct_chg"]].rename(
+                columns={"sector": "行业", "net_amount": "净额(元)", "pct_chg": "涨跌幅"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.warning("行业资金流暂不可用（东财限流）")
+    with col2:
+        ch = concept_heat()
+        if not ch.empty and "heat_score" in ch:
+            st.markdown("**题材热度 Top10**")
+            st.dataframe(ch.head(10)[["concept", "pct_chg", "heat_score"]].rename(
+                columns={"concept": "题材", "pct_chg": "涨跌幅", "heat_score": "热度分"}),
+                use_container_width=True, hide_index=True)
+        else:
+            st.warning("题材热度暂不可用（东财限流, 仅同花顺题材名）")
+
+    st.divider()
+    # 4. 多因子评分排行
+    st.subheader("🧪 多因子评分排行")
+    mf = multifactor_signal(cfg, pool=pk)
+    if not mf["candidates"].empty:
+        show = ["name", "code", "close", "trend", "mom", "rs", "multifactor_score"]
+        show = [c for c in show if c in mf["candidates"].columns]
+        st.dataframe(mf["candidates"][show].rename(columns={
+            "name": "名称", "code": "代码", "close": "现价", "trend": "趋势分",
+            "mom": "动量", "rs": "相对强度", "multifactor_score": "综合分"}),
+            use_container_width=True, hide_index=True)
+
+    st.divider()
+    # 5. 回测 (折叠)
+    with st.expander("🔬 回测（高级, 默认收起）", expanded=False):
+        @st.cache_data(show_spinner="回测智能策略...", ttl=600)
+        def _bt_smart(pk):
+            from strategy.etf import backtest_multifactor, backtest_rotation_flow
+            return backtest_rotation_flow(cfg) if pk == "sector" else backtest_multifactor(cfg, pool="broad")
+        _show_etf_backtest(_bt_smart(pk), "etf_smart", "智能策略")
+
+
 def page_etf():
     st.title("📊 ETF策略")
     st.caption("场内宽基 · 给你操作建议(持有/卖出/观望 + 原因), 不只是回测")
     cfg = get_cfg()
-    tab_trend, tab_rot = st.tabs(["📈 趋势择时", "🔄 动量轮动"])
+    tab_trend, tab_rot, tab_smart = st.tabs(["📈 趋势择时", "🔄 动量轮动", "🧠 智能策略"])
     with tab_trend:
         _page_trend(cfg)
     with tab_rot:
         _page_rotation(cfg)
+    with tab_smart:
+        _page_smart(cfg)
 
 
 # ============== 页面: 短线博弈 ==============
