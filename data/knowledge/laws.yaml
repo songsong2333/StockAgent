@@ -1,0 +1,63 @@
+# 经济研究 Agent —— 规律知识库
+# 持续累积的"经济学规律"。status: tentative(待定) / confirmed(已验证) / refuted(已证伪)
+# agent 提议永远写 tentative; 升 confirmed 需过统计门槛或人工确认(source=user)。
+# 诚实约束: 小样本(N)的结论只是"假设生成", 不是定论。
+
+laws:
+  - id: elec-window-drift
+    statement: "中证电力指数历年93%的年份有>5%主升浪, 但起止月份漂移大(start std~3月), 固定'每年6-9月'的简单假设不成立——7/8月均值反为负, 最强单月是11月"
+    status: tentative
+    evidence:
+      n_years: 14
+      hit_rate: 0.93
+      start_std: 3.0
+      strongest_month: 11
+      strongest_month_mean_pct: 0.030
+      strongest_month_ci: "[+0.7%,+5.7%]"
+      source_tool: detect_windows
+    related_series: ["159611"]
+    source: agent
+    created: 2026-08-01
+    last_tested: 2026-08-01
+    history:
+      - date: 2026-08-01
+        action: proposed
+        note: 首轮 detect_windows+seasonality_stats 发现, 修正了"固定6-9月"直觉
+
+  - id: enso-elec-rally
+    statement: "厄尔尼诺(ENSO ONI)首次跨+0.5后的6-8个月, 中证电力指数累计收益均值转正(+6~7%), 提示夏季高温预期可能驱动电力行情延后启动"
+    status: tentative
+    evidence:
+      n_events: 5
+      cumret_plus6m_pct: 0.064
+      cumret_plus8m_pct: 0.071
+      iqr_lo_plus6m_pct: 0.030
+      source_tool: anchor_event_study
+      caveat: 5个事件年, 相关非因果
+    related_series: ["159611", "enso_oni"]
+    source: agent
+    created: 2026-08-01
+    last_tested: 2026-08-01
+    history:
+      - date: 2026-08-01
+        action: proposed
+        note: anchor_event_study(ONI→电力) 首轮发现
+
+  - id: hk-ali-broad-market
+    statement: "港股阿里巴巴(09988)月频收益与电池/电力/白酒/沪深300的相关(0.45-0.49)强于与创业板(0.34)——它跟的是大盘+成长板块整体, 非创业板独有"
+    status: tentative
+    evidence:
+      n_months: 66
+      top_corr: "电池ETF 0.49 / 电力ETF 0.48 / 白酒ETF 0.47 / 沪深300 0.45"
+      cyb_corr: 0.34
+      fdr_q_cyb: 0.006
+      source_tool: discover
+      caveat: 月频下无显著lead-lag(同步运动)
+    related_series: ["09988", "159755", "159611", "512690", "510300", "159915"]
+    source: agent
+    created: 2026-08-01
+    last_tested: 2026-08-01
+    history:
+      - date: 2026-08-01
+        action: proposed
+        note: discover(target=09988) 首轮发现, 修正"跟随创业板"直觉

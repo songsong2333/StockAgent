@@ -12,8 +12,11 @@ venv/
 data/raw/
 data/qlib_data/
 data/etf/
+data/hk/
+data/store/
 data/cache/
 !data/cache/.gitkeep
+# 注: data/knowledge/laws.yaml 是规律知识库(小 YAML), 保留入库
 
 # 日志
 *.log

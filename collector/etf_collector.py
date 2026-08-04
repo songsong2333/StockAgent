@@ -18,6 +18,10 @@ from common import setup_logger, ensure_dir, load_config, PROJECT_ROOT
 
 log = setup_logger("collector.etf")
 
+# 标的池中"含可交易/指数序列的 list 组"——pool_codes/load_etf_pool/update_all 统一遍历,
+# 新增组(如 seasonal)只需在此加一项, 三处自动覆盖。
+_POOL_GROUPS = ("broad", "sector", "seasonal")
+
 # 东财 fund_etf_hist_em 中文列 -> 标准英文(与 daily_collector 对齐)
 _EM_COL_MAP = {
     "日期": "date", "开盘": "open", "收盘": "close", "最高": "high", "最低": "low",
@@ -146,19 +150,20 @@ def load_etf_pool(cfg: dict) -> dict:
     with open(p, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     # 规范化 code 为 6 位字符串
-    for grp in ("broad", "sector"):
+    for grp in _POOL_GROUPS:
         for it in data.get(grp, []) or []:
             it["code"] = str(it["code"]).strip().zfill(6)
     return data
 
 
 def pool_codes(cfg: dict) -> List[str]:
-    """标的池全部代码(benchmark + broad + sector), 去重保序。"""
+    """标的池全部代码(benchmark + 各 list 组), 去重保序。"""
     pool = load_etf_pool(cfg)
     codes: List[str] = []
     seen = set()
-    seq = [pool.get("benchmark_etf")] + [it["code"] for it in pool.get("broad", [])] \
-        + [it["code"] for it in pool.get("sector", [])]
+    seq = [pool.get("benchmark_etf")]
+    for grp in _POOL_GROUPS:
+        seq += [it["code"] for it in pool.get(grp, []) or []]
     for c in seq:
         c = str(c).strip().zfill(6)
         if c and c not in seen:
@@ -183,7 +188,7 @@ def update_all(cfg: dict, codes: Optional[List[str]] = None,
     # 从标的池建 code→index 映射(有映射的走新浪指数源, 避开东财限流)
     pool = load_etf_pool(cfg)
     idx_map = {}
-    for grp in ("broad", "sector"):
+    for grp in _POOL_GROUPS:
         for it in pool.get(grp, []) or []:
             if it.get("index"):
                 idx_map[str(it["code"]).strip().zfill(6)] = it["index"]

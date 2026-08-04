@@ -88,7 +88,7 @@ elif IS_WIN:
 # app.py 作为脚本由 streamlit 加载 -> 打进 _MEIPASS/app/ (desktop_app._app_file 据此定位)
 datas += [(os.path.join(ROOT, "app", "app.py"), "app")]
 # config 模板: 首次运行由 common.ensure_user_config 拷贝到用户数据目录
-for f in ("config.yaml", "etf_pool.yaml", "watchlist.yaml", "sector_leaders.yaml", "sector_stocks.yaml"):
+for f in ("config.yaml", "etf_pool.yaml", "alt_sources.yaml", "watchlist.yaml", "sector_leaders.yaml", "sector_stocks.yaml"):
     src = os.path.join(ROOT, "config", f)
     if os.path.exists(src):
         datas += [(src, "config_template")]

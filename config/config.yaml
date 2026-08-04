@@ -9,6 +9,8 @@ paths:
   cache_dir: data/cache        # 财务/ST/持仓/日志等缓存
   log_dir: data/cache/logs
   etf_dir: data/etf            # ETF parquet(独立于个股 raw_dir, 不走qlib)
+  hk_dir: data/hk              # 港股日线 parquet(周期探索平台用, 走新浪 stock_hk_daily)
+  store_dir: data/store        # 统一序列存储: 替代数据(宏观/能源/商品/气候)月频 parquet
 
 # ---------------- 数据采集 ----------------
 collector:
@@ -79,6 +81,39 @@ etf:
     hot_zha: 0.4                     # 过热炸板率阈值(同时满足才过热)
     panic_temp: 25                   # 恐慌温度阈值
     panic_dt: 100                    # 恐慌跌停数阈值
+
+# ---------------- 周期探索平台 (中期季节性/相关性/regime/驱动归因) ----------------
+# 与日线 ETF 策略互补: 服务周级/月级行情判断。一切皆"序列"(ETF/行业指数/港股/商品/宏观/气候),
+# 统一进 data/store + data/etf + data/hk, 由 collector.store.universe_panel 对齐成面板。
+# 统计诚实优先: 长历史(行业指数10-17年/宏观数十年)做主体; 小样本标灰; 多重检验走 BH-FDR。
+cycle:
+  freq: "M"                    # 默认分析频率: M月 / W周(季节性/regime用月, lead-lag可切周)
+  universe_categories: ["broad", "sector", "seasonal", "hk", "macro", "energy", "commodity", "climate"]
+  min_n: 5                     # 最小样本量: 低于此值的统计结果标灰, 不参与"最强"排序
+  fdr_alpha: 0.05              # BH-FDR 多重检验显著性水平(全宇宙两两扫描≈数千对, 必须校正)
+  max_lag: 8                   # lead-lag 最大滞后(周)
+  bootstrap_iters: 1000        # 置信区间 bootstrap 次数
+  ci: 0.95                     # 置信水平
+  window:                      # 事件窗口检测(替代固定日历月分桶, 捕捉"窗口漂移")
+    method: "peak"             # peak(主升浪峰谷区间) / runlength(最长连阳) / zscore
+    cross_validate: true       # 跑两种方法, 起止不一致的年份标注
+  regime:                      # regime 标注(条件分布: 如厄尔尼诺年电力窗口是否更长/更晚)
+    enso_threshold: 0.5        # ONI >= +0.5 连续5月 = 厄尔尼诺; <= -0.5 = 拉尼娜
+    market_ma: 12              # 月线牛熊regime的MA窗口(月)
+    liquidity_lookback: 12     # 流动性宽紧判定的回看窗口(月)
+
+# ---------------- 经济研究 Agent (GLM 大脑 + 工具调用 + 规律知识库) ----------------
+# agent 的 tools = strategy/{seasonality,discovery,regime}.py(已建好)。本块配置 LLM 客户端。
+# 统计诚实: 规律入库默认 tentative, 升 confirmed 需过门槛或人工; 相关非因果。
+agent:
+  api_key_env: ZHIPUAI_API_KEY     # 智谱 API key 的环境变量名(仿 license.secret_env); 无 key 时优雅降级
+  base_url: ""                     # 留空用 zhipuai 默认; 或填 open.bigmodel.cn 兼容端点
+  model_monitor: glm-4.5-air       # 监控摘要用(便宜, ¥0.8/¥2 每百万 token)
+  model_chat: glm-4.6              # 对话用(agent 调优, 200K 上下文)
+  max_rounds: 8                    # tool-calling 循环上限(防失控)
+  enable_monitor: true
+  knowledge_dir: data/knowledge    # 规律库 + 监控快照目录
+  monitor_cadence: weekly          # 周频(中期研究, 日频太吵)
 
 # ---------------- 因子与模型 ----------------
 model:

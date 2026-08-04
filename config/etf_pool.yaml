@@ -21,3 +21,16 @@ sector:                        # B类: 行业/主题(看大盘趋势做相对短
   - {code: "512800", name: "银行ETF", sector: 金融}
   - {code: "512010", name: "医药ETF", sector: 医药}
   - {code: "512660", name: "军工ETF", sector: 军工}
+
+seasonal:                      # C类: 周期/季节性行业(季节性+regime分析主体)
+  # 存的是中证/国证【行业指数】点位(走新浪 stock_zh_index_daily, 稳定不限流, 历史10-17年),
+  # 不是ETF元价 —— 与 broad 组(510300存sh000300指数点)同套路, 信号/季节性/相关通用。
+  # code 字段为可交易ETF代码(标签, 部分待核验), index 为实际采集的行业指数。
+  - {code: "159611", name: "电力ETF",   index: "sz399554", sector: 电力}    # 中证电力 2013-
+  - {code: "515220", name: "煤炭ETF",   index: "sz399998", sector: 煤炭}    # 中证煤炭 2015-
+  - {code: "512400", name: "有色ETF",   index: "sz399395", sector: 有色}    # 国证有色 2012-
+  - {code: "515210", name: "钢铁ETF",   index: "sz399440", sector: 钢铁}    # 国证钢铁 2014-
+  - {code: "512000", name: "券商ETF",   index: "sz399807", sector: 非银}    # 中证全指证券 2015-
+  - {code: "512690", name: "白酒ETF",   index: "sz399812", sector: 食品饮料} # 国证白酒 2015-
+  - {code: "516160", name: "新能源ETF", index: "sz399808", sector: 新能源}  # 中证新能源 2015-
+  - {code: "512980", name: "传媒ETF",   index: "sz399971", sector: 传媒}    # 中证传媒 2014-

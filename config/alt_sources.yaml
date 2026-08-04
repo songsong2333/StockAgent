@@ -1,0 +1,39 @@
+# 周期探索平台 — 替代/参照数据清单 (可插拔注册表)
+# 加新序列不改代码: 在此追加一条即可。alt_collector 按 source 分发采集。
+#
+# source 类型:
+#   hk       港股个股  → data/hk/<id>.parquet (日频, 走新浪 stock_hk_daily, adjust=qfq)
+#   futures  商品期货  → data/store/<id>.parquet (日频采, 转月频收盘, 走新浪 futures_zh_daily_sina)
+#   akshare  ak宏观数据 → data/store/<id>.parquet (取 col 列, 转月频)
+#   csv      本地/URL  → data/store/<id>.parquet (parser 指定解析器, 如 noaa_oni)
+#
+# freq = 目标频率(均重采样到月对齐)。id 全局唯一, 作 series 主键。
+# ⚠️ 东财(eastmoney)源在本环境持续限流, 故宏观/商品优先新浪/akshare 非东财接口。
+
+hk:                            # 港股参照(用户关注的标的在此添加, 或在 UI 输入)
+  - {id: "09988", name: "阿里巴巴-W"}
+  - {id: "03690", name: "美团-W"}
+  - {id: "00700", name: "腾讯控股"}
+  # 注: 用户口述"港股智谱"身份待确认(智谱AI未上市); 确认后在 UI 输入或加到这里。
+
+macro:                         # 宏观流动性
+  - {id: "m2_yoy",   name: "M2同比",       source: akshare, func: "macro_china_money_supply",
+     col: "货币和准货币(M2)-同比增长", date_col: "月份", freq: M}
+  - {id: "lpr1y",    name: "1年期LPR",     source: akshare, func: "macro_china_lpr",
+     col: "LPR1Y", date_col: "TRADE_DATE", freq: M}
+
+energy:                        # 能源基本面(电力/煤炭核心驱动)
+  - {id: "electricity_yoy", name: "全社会用电量同比", source: akshare, func: "macro_china_society_electricity",
+     col: "全社会用电量同比", date_col: "统计时间", freq: M}
+  - {id: "oil_price", name: "油价(汽油)", source: akshare, func: "energy_oil_hist",
+     col: "汽油价格", date_col: "调整日期", freq: M}
+
+commodity:                     # 商品期货(周期股的商品锚)
+  - {id: "copper", name: "沪铜连续", source: futures, code: "CU0"}   # 2005- (有色锚)
+  - {id: "crude",  name: "原油连续", source: futures, code: "SC0"}   # 2018- (能源锚)
+
+climate:                       # 气候(ENSO/气温, 驱动季节性行情的外因)
+  - {id: "enso_oni", name: "ENSO-ONI(海温异常)", source: csv,
+     url: "https://psl.noaa.gov/data/correlation/oni.data", parser: "noaa_oni", freq: M}
+  # 气温: akshare 无可靠历史源, 首版占位 —— 后续接气象API或捆绑CSV(放 config/alt/ 下)
+  # - {id: "temp_cn", name: "中国均温", source: csv, path: "config/alt/temp_cn.csv", parser: "monthly_csv"}

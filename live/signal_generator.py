@@ -12,7 +12,8 @@ from typing import List, Tuple
 import pandas as pd
 
 from common import load_config, setup_logger, to_raw_code
-from backtest.qlib_runner import train_and_predict
+from backtest.qlib_runner import train_and_predict, latest_qlib_date
+from factor.handler import build_live_dataset_config
 
 log = setup_logger("live.signal")
 
@@ -26,7 +27,12 @@ def generate_target_portfolio(cfg: dict, topk: int = None, weight_scheme: str = 
     topk = topk or lc["topk"]
     weight_scheme = weight_scheme or lc.get("weight_scheme", "equal")
 
-    _, model, pred = train_and_predict(cfg)
+    # 实盘推理: 训练/验证窗滚动到最新, 预测最新可用交易日(与回测固定 test 段解耦)。
+    # as_of = 已 dump 数据的最新日; 采集更新后, 信号自动前移。
+    as_of = latest_qlib_date(cfg)
+    log.info(f"实盘推理 as_of={as_of.date()} (qlib 最新数据日)")
+    _, model, pred = train_and_predict(
+        cfg, dataset_config=build_live_dataset_config(cfg, as_of))
 
     # pred 可能是 Series 或 DataFrame, 统一成带 score 列的 Series (MultiIndex: datetime, instrument)
     if isinstance(pred, pd.DataFrame):

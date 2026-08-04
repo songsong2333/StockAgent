@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Tuple, Optional
 
+import pandas as pd
 import qlib
 from qlib.config import REG_CN
 from qlib.utils import init_instance_by_config
@@ -37,16 +38,57 @@ def init_qlib(cfg: dict):
     log.info(f"qlib 初始化完成, provider_uri={p}")
 
 
-def train_and_predict(cfg: dict):
-    """训练模型并预测, 返回 (dataset, pred)。"""
+def latest_qlib_date(cfg: dict):
+    """universe 数据的最新可用交易日(实盘推理的 as_of)。
+
+    不能用全局 qlib 日历末日——它会被基准指数等拖到 universe 实际没有数据的日期,
+    导致 test 段空截面(0 条预测/KeyError NaT)。改为逐票读 raw parquet 的最后日期
+    再取中位数: 对个别陈旧票稳健, 保证 as_of 落在大多数 universe 票都有数据处。
+    universe="all" 时退回全局日历。
+    """
+    from factor.handler import load_universe
+    uni = load_universe(cfg)
+    if uni == "all":
+        init_qlib(cfg)
+        from qlib.data import D
+        return pd.Timestamp(D.calendar(freq="day")[-1])
+    raw_dir = resolve_data_path(cfg["paths"]["raw_dir"])
+    last_dates = []
+    for qc in uni:
+        f = raw_dir / f"{qc}.parquet"   # raw 文件按完整 qlib 代码命名, 如 SZ300308.parquet
+        if not f.exists():
+            continue
+        try:
+            d = pd.read_parquet(f)
+            if "date" in d.columns:
+                last_dates.append(pd.to_datetime(d["date"]).max())
+            elif isinstance(d.index, pd.DatetimeIndex):
+                last_dates.append(d.index.max())
+        except Exception:
+            continue
+    if not last_dates:
+        init_qlib(cfg)   # 兜底: raw 缺失时用全局日历
+        from qlib.data import D
+        return pd.Timestamp(D.calendar(freq="day")[-1])
+    last_dates.sort()
+    return pd.Timestamp(last_dates[len(last_dates) // 2])   # 中位数, 稳健
+
+
+def train_and_predict(cfg: dict, dataset_config: dict = None, segment: str = "test"):
+    """训练模型并预测, 返回 (dataset, model, pred)。
+
+    dataset_config: 数据集配置; 默认 build_dataset_config(cfg)(回测固定分段, 可复现)。
+                    实盘推理传 build_live_dataset_config(cfg, as_of)(滚动窗, 预测最新日)。
+    segment: 预测哪个段, 默认 "test"。
+    """
     init_qlib(cfg)
-    dataset = init_instance_by_config(build_dataset_config(cfg))
+    dataset = init_instance_by_config(dataset_config or build_dataset_config(cfg))
     model = init_instance_by_config(build_model_config(cfg))
     log.info("开始训练模型...")
     with R.start(experiment_name="multi_factor"):
         R.log_params(model_class=cfg["model"]["model_class"])
         model.fit(dataset)
-        pred = model.predict(dataset)
+        pred = model.predict(dataset, segment=segment)
     log.info(f"预测完成, {len(pred)} 条预测值")
     return dataset, model, pred
 

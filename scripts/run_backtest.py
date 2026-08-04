@@ -21,8 +21,8 @@ def main():
     cfg = load_config()
     log.info("=== 开始回测 ===")
     metrics, report, positions = run_backtest(cfg)
-    print_report(metrics, report)
-    save_report(metrics, report, Path(cfg["paths"]["cache_dir"]))
+    print_report(metrics, report, cfg)
+    save_report(metrics, report, Path(cfg["paths"]["cache_dir"]), cfg=cfg)
     log.info("=== 回测完成 ===")
 
 

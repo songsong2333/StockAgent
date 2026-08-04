@@ -690,7 +690,7 @@ def page_backtest():
                 from backtest.qlib_runner import run_backtest
                 from backtest.report import save_report
                 metrics, report, positions = run_backtest(cfg)
-                save_report(metrics, report, Path(cfg["paths"]["cache_dir"]))
+                save_report(metrics, report, Path(cfg["paths"]["cache_dir"]), cfg=cfg)
                 st.session_state["bt_metrics"] = metrics
                 st.session_state["bt_report"] = report
                 st.session_state["bt_positions"] = positions
@@ -702,12 +702,27 @@ def page_backtest():
     report = st.session_state.get("bt_report")
     if metrics:
         st.subheader("关键指标")
+        # 诚实优先: 头条放"区间真实收益", 年化外推降级为带警示的次级指标
+        period_ret = n_days = None
+        if report is not None and not report.empty and "account" in report.columns and len(report) > 1:
+            a0, a1 = float(report["account"].iloc[0]), float(report["account"].iloc[-1])
+            if a0 > 0:
+                period_ret = a1 / a0 - 1
+                n_days = len(report)
         c1, c2, c3, c4 = st.columns(4)
-        # qlib 指标键名: annualized_return, information_ratio, max_drawdown
-        c1.metric("年化收益", f"{metrics.get('annualized_return', 0):.2%}")
-        c2.metric("夏普/IR", f"{metrics.get('information_ratio', 0):.3f}")
-        c3.metric("最大回撤", f"{metrics.get('max_drawdown', 0):.2%}")
+        c1.metric("区间收益(真实)", f"{period_ret:+.1%}" if period_ret is not None else "-")
+        c2.metric("最大回撤", f"{metrics.get('max_drawdown', 0):.2%}")
+        c3.metric("夏普/IR", f"{metrics.get('information_ratio', 0):.3f}")
         c4.metric("年化波动", f"{metrics.get('std', 0):.2%}")
+        if n_days is not None:
+            years = n_days / 252
+            ann = metrics.get("annualized_return", 0)
+            if years < 1.5:
+                st.caption(f"⚠️ 测试区间仅 {n_days} 个交易日(≈{years:.1f} 年)。qlib 的年化收益 "
+                           f"{ann:.1%} 是把这段收益**年化外推**的数字, 会显著放大, 不代表可持续年化能力; "
+                           f"且为 topk={cfg['backtest']['topk']} 集中持仓 + 小股票池, 注意过拟合。请以区间收益为准。")
+            else:
+                st.caption(f"测试区间 {n_days} 个交易日(≈{years:.1f} 年), 年化收益 {ann:.1%}。")
 
         with st.expander("全部指标"):
             st.json({k: (round(v, 4) if isinstance(v, float) else v) for k, v in metrics.items()})
@@ -1261,17 +1276,308 @@ def _page_smart(cfg):
         _show_etf_backtest(_bt_smart(pk), "etf_smart", "智能策略")
 
 
+def _page_explore(cfg):
+    """🔬 周期探索: 事件窗口季节性 + 探索发现 + regime 条件(中期周/月级研究)。
+
+    顶级 import(遵守 app-dir-on-syspath: 不在 app.py 里 from app.X)。
+    """
+    import plotly.graph_objects as go
+    from collector.store import universe_panel
+    from strategy.seasonality import (seasonality_stats, window_distribution,
+        anchor_event_study, window_to_markdown)
+    from strategy.discovery import discover, cluster_series, lead_lag_matrix, lead_lag_graph
+    from strategy.regime import (enso_regime_by_year, market_regime_by_year,
+        liquidity_regime_by_year, conditional_window_stats, medium_term_signal)
+
+    st.subheader("🔬 周期探索平台")
+    st.caption("中期(周/月级)季节性 + 相关性 + regime 研究。一切皆序列(ETF/行业指数/港股/商品/宏观/气候)。"
+               "⚠️ 统计诚实: 长历史做主体, 小样本标灰, 多重检验走 FDR; 相关≠因果, 结论是假设生成器。")
+
+    cc = cfg.get("cycle", {})
+    cats = cc.get("universe_categories", ["broad", "sector", "seasonal", "hk",
+                                           "macro", "energy", "commodity", "climate"])
+    sel_cats = st.multiselect("探索宇宙(类别)", cats, default=cats, key="exp_cats")
+    if not sel_cats:
+        st.warning("至少选一个类别")
+        return
+    freq = st.radio("频率", ["M 月", "W 周"], horizontal=True, key="exp_freq")
+    fq = "M" if freq.startswith("M") else "W"
+
+    @st.cache_data(show_spinner="加载序列...", ttl=300)
+    def _panel(sel, fq):
+        from common import load_config as _lc
+        return universe_panel(_lc(), list(sel), fq)
+    panel, names, meta = _panel(tuple(sel_cats), fq)
+    if panel.empty:
+        st.warning("无数据。先在终端跑: `python scripts/init_cycle.py --years 15`")
+        return
+
+    price_ids = [c for c in panel.columns if meta.get(c, {}).get("kind") == "price"]
+    rate_ids = [c for c in panel.columns if meta.get(c, {}).get("kind") == "rate"]
+    st.caption(f"已加载 **{panel.shape[1]} 序列** × {panel.shape[0]} {fq}期 "
+               f"({panel.index.min().date()}~{panel.index.max().date()})")
+
+    def _opts(ids):
+        return {c: f"{names.get(c, c)} ({c})" for c in ids}
+
+    tab1, tab2, tab3 = st.tabs(["📅 事件窗口季节性", "🕸 探索发现", "📐 regime 条件"])
+
+    # ====== Tab1: 事件窗口季节性 ======
+    with tab1:
+        target = st.selectbox("选标的", price_ids, format_func=lambda c: _opts(price_ids).get(c, c),
+                              key="exp_t1")
+        level = panel[target].dropna()
+        min_n = cc.get("min_n", 5)
+
+        st.markdown(f"**月度季节性(固定分桶, 带 95% bootstrap CI; N<{min_n} 标灰)**")
+        stats = seasonality_stats(level, min_n=min_n)
+        if not stats.empty:
+            ok = stats["n"] >= min_n
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=stats.index, y=stats["mean"] * 100,
+                error_y=dict(type="data", symmetric=False,
+                             array=(stats["ci_hi"] - stats["mean"]) * 100,
+                             arrayminus=(stats["mean"] - stats["ci_lo"]) * 100),
+                marker_color=[("#2ca02c" if m > 0 else "#d62728") if sufficient else "#cccccc"
+                              for m, sufficient in zip(stats["mean"], ok)],
+                text=[f"N={n}" for n in stats["n"]], textposition="outside"))
+            fig.add_hline(y=0, line_color="gray", line_width=1)
+            fig.update_layout(xaxis_title="月份", yaxis_title="均值收益 %", height=340,
+                              showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("⚠️ " + stats.attrs.get("warning", ""))
+
+        st.markdown("**行情窗口分布(逐年检出, 刻画漂移; 起止 std 越大 = 漂移越大)**")
+        dist = window_distribution(level, method=cc.get("window", {}).get("method", "peak"),
+                                   cross_validate=cc.get("window", {}).get("cross_validate", True),
+                                   min_n=min_n)
+        st.markdown(window_to_markdown(dist, names.get(target, target)))
+        if dist.get("windows") is not None and not dist["windows"].empty:
+            st.dataframe(dist["windows"][["year", "start", "end", "duration",
+                                          "magnitude", "inconsistent"]],
+                         use_container_width=True, hide_index=True)
+
+        st.markdown("**锚点 event-study(外因 → 行情是否系统性跟动)**")
+        if rate_ids:
+            anchor = st.selectbox("锚点序列(ENSO/用电量/利率...)", rate_ids,
+                                  format_func=lambda c: _opts(rate_ids).get(c, c), key="exp_anchor")
+            c_dir, c_thr, c_pre, c_post = st.columns(4)
+            direction = c_dir.radio("事件", ["above ≥阈值", "below ≤阈值"], horizontal=True, key="exp_dir")
+            thr = c_thr.number_input("阈值", value=0.5, step=0.1, key="exp_thr")
+            pre = c_pre.slider("事件前(期)", 1, 12, 4, key="exp_pre")
+            post = c_post.slider("事件后(期)", 1, 12, 8, key="exp_post")
+            d = "above" if direction.startswith("above") else "below"
+            res = anchor_event_study(level, panel[anchor].dropna(), threshold=thr,
+                                     direction=d, pre=pre, post=post)
+            if res.get("n_events"):
+                c = res["curve"]
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=c["offset"], y=c["mean"] * 100, name="均值",
+                                          line=dict(color="#1f77b4", width=2)))
+                fig2.add_trace(go.Scatter(
+                    x=list(c["offset"]) + list(c["offset"][::-1]),
+                    y=list(c["hi"] * 100) + list(c["lo"] * 100)[::-1],
+                    fill="toself", name="四分位带", line=dict(width=0),
+                    fillcolor="rgba(31,119,180,0.2)"))
+                fig2.add_hline(y=0, line_dash="dot", line_color="gray")
+                fig2.update_layout(xaxis_title="相对事件月的期数", yaxis_title="累计收益 %",
+                                   height=340, showlegend=False)
+                st.plotly_chart(fig2, use_container_width=True)
+                st.caption(f"{res['n_events']} 个事件年: {', '.join(res['event_dates'])}。"
+                           + res.get("warning", ""))
+            else:
+                st.info(res.get("warning", "无事件年(调阈值/方向)"))
+        else:
+            st.caption("无 rate 类锚点序列(需采 ENSO/宏观)")
+
+    # ====== Tab2: 探索发现 ======
+    with tab2:
+        ret = panel[price_ids].pct_change(fill_method=None).dropna(how="all")
+        target2 = st.selectbox("选 target(看谁跟随它/谁领先它)", price_ids,
+                               format_func=lambda c: _opts(price_ids).get(c, c), key="exp_t2")
+
+        @st.cache_data(show_spinner="扫描相关性...", ttl=600)
+        def _disc(sel, fq, tgt):
+            from common import load_config as _lc
+            p, nm, mt = universe_panel(_lc(), list(sel), fq)
+            pids = [c for c in p.columns if mt.get(c, {}).get("kind") == "price"]
+            rt = p[pids].pct_change(fill_method=None).dropna(how="all")
+            return discover(tgt, rt, mt, nm)
+        res = _disc(tuple(sel_cats), fq, target2)
+        if "error" in res:
+            st.warning(res["error"])
+        else:
+            st.caption(res["warning"])
+            t = res["table"]
+            show = t.rename(columns={"name": "名称", "category": "类别", "corr": "相关",
+                "q": "FDR-q", "beta": "beta", "r2": "R²", "best_lag": "领先期",
+                "stability": "稳定性", "significant": "显著"})
+            show["显著"] = show["显著"].map({True: "✅", False: ""})
+            st.dataframe(show[["名称", "类别", "相关", "FDR-q", "beta", "R²",
+                               "领先期", "稳定性", "显著"]].head(12),
+                         use_container_width=True, hide_index=True)
+
+        st.markdown("**相关热力图(收益率, 聚类排序)**")
+        cl = cluster_series(ret)
+        order = [c for c in cl["order"] if c in ret.columns]
+        if len(order) > 1:
+            sub = ret[order].corr()
+            fig3 = go.Figure(data=go.Heatmap(
+                z=sub.values, x=[names.get(c, c) for c in order],
+                y=[names.get(c, c) for c in order], colorscale="RdBu_r",
+                zmid=0, zmin=-1, zmax=1))
+            fig3.update_layout(height=520, margin=dict(l=0, r=0, t=0, b=0))
+            st.plotly_chart(fig3, use_container_width=True)
+
+        st.markdown("**顶级领先指标(领先最多下游 = 隐藏先行指标)**")
+        ll = lead_lag_matrix(ret, max_lag=cc.get("max_lag", 8))
+        g = lead_lag_graph(ll, meta, names, corr_threshold=0.3)
+        if not g["leaders"].empty:
+            st.dataframe(g["leaders"].rename(columns={
+                "name": "名称", "category": "类别", "n_followers": "领先数",
+                "avg_corr": "平均相关", "leadership": "领先分"}).head(10),
+                use_container_width=True, hide_index=True)
+        else:
+            st.caption("无足够强的领先关系( corr 阈值 0.3, 月频可能偏弱)")
+
+    # ====== Tab3: regime 条件 ======
+    with tab3:
+        target3 = st.selectbox("选标的", price_ids,
+                               format_func=lambda c: _opts(price_ids).get(c, c), key="exp_t3")
+        rtype = st.selectbox("regime 维度",
+                             ["ENSO(厄尔尼诺/拉尼娜)", "市场牛熊", "流动性(M2)"], key="exp_rtype")
+        level3 = panel[target3].dropna()
+        label_map = {}
+        ry = None
+        if rtype.startswith("ENSO") and "enso_oni" in panel.columns:
+            ry = enso_regime_by_year(panel["enso_oni"],
+                                     threshold=cc["regime"]["enso_threshold"])
+            label_map = {1: "厄尔尼诺", -1: "拉尼娜", 0: "中性"}
+        elif rtype.startswith("市场"):
+            bench = "510300" if "510300" in panel.columns else (price_ids[0] if price_ids else None)
+            if bench is not None:
+                ry = market_regime_by_year(panel[bench],
+                                           ma=cc["regime"]["market_ma"])
+            label_map = {1: "牛市", -1: "熊市", 0: "震荡"}
+        elif rtype.startswith("流动性") and "m2_yoy" in panel.columns:
+            ry = liquidity_regime_by_year(panel["m2_yoy"],
+                                          lookback=cc["regime"]["liquidity_lookback"],
+                                          direction="rise")
+            label_map = {1: "宽松", -1: "收紧", 0: "中性"}
+        if ry is None or ry.empty:
+            st.warning("该 regime 维度无可用数据(需采 ENSO/沪深300/M2)")
+        else:
+            cond = conditional_window_stats(
+                level3, ry, method=cc.get("window", {}).get("method", "peak"))
+            st.caption(cond.get("warning", "按 regime 分组的窗口分布对比"))
+            rows = []
+            for lab, n in cond.get("_regimes", {}).items():
+                d = cond.get(lab, {})
+                if d.get("n_years", 0) == 0:
+                    continue
+                lname = label_map.get(_safe_int(lab), lab)
+                rows.append({"regime": f"{lname} (N={n})",
+                             "起月中位": d["start"]["median"], "止月中位": d["end"]["median"],
+                             "持续中位": d["duration"]["median"],
+                             "幅度中位": d["magnitude"]["median"],
+                             "幅度CI": f"[{d['magnitude']['ci_lo']:+.1%},{d['magnitude']['ci_hi']:+.1%}]"})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("无窗口可分组")
+
+        st.markdown("**月级趋势 regime(该不该做这个方向)**")
+        sig = medium_term_signal(cfg, target3)
+        if "error" in sig:
+            st.warning(sig["error"])
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("regime", sig["regime"])
+            c2.metric("现价", sig["price"])
+            c3.metric("MA3/6/12", f"{sig['ma3']}/{sig['ma6']}/{sig['ma12']}")
+            c4.metric("多头排列", "✅" if sig["bull_aligned"] else "❌")
+            st.info(sig["advice"])
+
+
+def _safe_int(x):
+    try:
+        return int(float(x))
+    except Exception:
+        return None
+
+
 def page_etf():
     st.title("📊 ETF策略")
     st.caption("场内宽基 · 给你操作建议(持有/卖出/观望 + 原因), 不只是回测")
     cfg = get_cfg()
-    tab_trend, tab_rot, tab_smart = st.tabs(["📈 趋势择时", "🔄 动量轮动", "🧠 智能策略"])
+    tab_trend, tab_rot, tab_smart, tab_explore = st.tabs(
+        ["📈 趋势择时", "🔄 动量轮动", "🧠 智能策略", "🔬 周期探索"])
     with tab_trend:
         _page_trend(cfg)
     with tab_rot:
         _page_rotation(cfg)
     with tab_smart:
         _page_smart(cfg)
+    with tab_explore:
+        _page_explore(cfg)
+
+
+def page_agent():
+    """🤖 研究助手: 与经济研究 agent 对话(调分析工具 + 规律知识库, 带 GLM 大脑)。"""
+    from agent.chat import reply
+    from agent.llm import has_key
+    from agent.knowledge import load_laws, law_to_summary
+
+    st.title("🤖 研究助手")
+    st.caption("中期经济研究 agent · 调用季节性/相关性/regime 工具 + 规律知识库 · "
+               "统计诚实(N/CI/FDR/相关非因果)。规律默认 tentative, 升 confirmed 需过门槛。")
+    cfg = get_cfg()
+    env = cfg.get("agent", {}).get("api_key_env", "ZHIPUAI_API_KEY")
+    if not has_key(cfg):
+        st.warning(f"⚠️ 未配置 {env}。终端 `export {env}=你的key` 后重启 app 即可对话"
+                   f"(open.bigmodel.cn 注册获取)。下方仍可输入, 我会提示配置。")
+
+    # 规律库速览(折叠)
+    laws = load_laws(cfg)
+    with st.expander(f"📚 规律知识库({len(laws)} 条)", expanded=False):
+        if laws:
+            for l in laws:
+                st.markdown("- " + law_to_summary(l))
+        else:
+            st.caption("空。agent 提议的规律会累积到这里。")
+        st.caption("改/确认规律: 编辑 data/knowledge/laws.yaml, 或在对话里让 agent 调 update_law_status。")
+
+    if "agent_msgs" not in st.session_state:
+        st.session_state["agent_msgs"] = []
+    c1, c2 = st.columns([1, 6])
+    if c2.button("清空对话"):
+        st.session_state["agent_msgs"] = []
+        st.rerun()
+    c1.caption(f"{len(st.session_state['agent_msgs'])} 条历史")
+
+    for m in st.session_state["agent_msgs"]:
+        with st.chat_message(m["role"]):
+            st.markdown(m["content"])
+            if m.get("trace"):
+                st.caption("🔧 调用工具: " + ", ".join(t["tool"] for t in m["trace"]))
+
+    if q := st.chat_input("问: 电力ETF现在能买吗? / 厄尔尼诺对煤炭什么影响? / 港股阿里跟谁走?"):
+        st.session_state["agent_msgs"].append({"role": "user", "content": q})
+        with st.chat_message("user"):
+            st.markdown(q)
+        history = [{"role": m["role"], "content": m["content"]}
+                   for m in st.session_state["agent_msgs"][:-1]]
+        with st.chat_message("assistant"):
+            with st.spinner("思考中(调工具 + 推理)..."):
+                res = reply(cfg, q, history=history)
+            st.markdown(res["content"])
+            if res.get("trace"):
+                st.caption("🔧 调用工具: " + ", ".join(t["tool"] for t in res["trace"]))
+            if res.get("truncated"):
+                st.caption("⚠️ 达到最大推理轮数")
+        st.session_state["agent_msgs"].append(
+            {"role": "assistant", "content": res["content"], "trace": res.get("trace", [])})
 
 
 # ============== 页面: 短线博弈 ==============
@@ -1553,7 +1859,8 @@ def page_recommend():
     target_csv = ROOT / cfg["paths"]["cache_dir"] / "target_portfolio.csv"
     cap = st.number_input("参考资金(元)", value=1_000_000, step=100_000, key="rec_cap")
     if target_csv.exists():
-        target = pd.read_csv(target_csv)
+        # code/qlib_code 按字符串读, 否则 pandas 把 '000977' 推断成整数 977 丢前导零
+        target = pd.read_csv(target_csv, dtype={"code": str, "qlib_code": str})
         try:
             from live.order_sheet import get_latest_prices
             tprices = get_latest_prices(target["qlib_code"].tolist(), cfg)
@@ -1614,6 +1921,7 @@ PAGES = {
     "💼 持仓与推荐": page_holdings,
     "🧪 自研模型": page_model_hub,
     "📊 ETF策略": page_etf,
+    "🤖 研究助手": page_agent,
     "🎰 短线博弈": page_shortterm,
     "⚡ 盘中预警 🔒": page_intraday,
 }
