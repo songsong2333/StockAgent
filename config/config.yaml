@@ -11,6 +11,7 @@ paths:
   etf_dir: data/etf            # ETF parquet(独立于个股 raw_dir, 不走qlib)
   hk_dir: data/hk              # 港股日线 parquet(周期探索平台用, 走新浪 stock_hk_daily)
   store_dir: data/store        # 统一序列存储: 替代数据(宏观/能源/商品/气候)月频 parquet
+  index_min_dir: data/index_min # 指数60min K线(进出场系统用, 新浪 stock_zh_a_minute)
 
 # ---------------- 数据采集 ----------------
 collector:
@@ -81,6 +82,37 @@ etf:
     hot_zha: 0.4                     # 过热炸板率阈值(同时满足才过热)
     panic_temp: 25                   # 恐慌温度阈值
     panic_dt: 100                    # 恐慌跌停数阈值
+
+# ---------------- 确定性进出场系统 (成长进攻 ↔ 红利防守, 60min 扳机 + 日线 conviction) ----------------
+# 进场=多条件共振(AND, 全满足才进, 确定性优先/低频); 离场=任一拐点预兆(OR, 敏感保命)。
+# 确定性分级 A/B/C(满足条件计数), 仅 A 级建议进场。进攻离场 -> 轮动到红利100 防守。
+entry_exit:
+  growth:                        # 进攻标的(指数源做信号, etf 为可交易标的)
+    # 中证500 已剔除: 实测偏震荡/均值回归, 趋势跟踪在其上 whipsaw 亏损(7年-33%)
+    - {index: "sz399006", etf: "159915", name: "创业板"}
+    - {index: "sh000688", etf: "588870", name: "科创50"}
+  defense: {etf: "515180", name: "红利100"}   # 防守仓位, 成长离场时切入
+  market: "sh000300"             # 大盘环境闸门(沪深300)
+  # 日线 conviction(确定性根基)
+  daily_ma_short: 20
+  daily_ma_long: 60
+  # 60min 扳机
+  ma_short: 20                   # 60min 短期均线(≈1周)
+  ma_long: 60                    # 60min 长期均线(≈3周)
+  breakout_lookback: 20          # 强度: 突破近N根60min高点(≈1周新高)
+  vol_mult: 1.5                  # 量能: 量 > vol_mult × 均量20
+  rsi_period: 14
+  rsi_lo: 50                     # 动量健康区间下限(强)
+  rsi_hi: 82                     # 上限放宽: 突破时RSI天然偏高(实测中位~71), 过热交给离场衰竭判断
+  atr_period: 14
+  atr_stop_mult: 2.0             # 初始止损 = 入场价 - ATR×mult
+  cooldown_bars: 8               # 离场后冷却N根60min再考虑进场(防打脸)
+  overextend_mult: 0.06          # 衰竭: 收盘偏离MA60超此比例(6%)且放量长上影 -> 离场
+  # v2 趋势跟踪(抗whipsaw, 2年回测18/18参数组合期望>0): Donchian突破 + ER趋势质量过滤 + ATR移动止损
+  donchian: 20                   # 突破回看窗口(20≈一周)
+  er_n: 30                       # Kaufman效率比窗口
+  er_min: 0.35                   # 趋势质量门槛: 越高越只做清晰趋势(抗震荡whipsaw); 实测0.35+宽止损最优
+  atr_trail_mult: 4.0            # 移动止损=持仓期最高收盘 - 4×ATR。宽止损让利润奔跑(实测优于2/3)
 
 # ---------------- 周期探索平台 (中期季节性/相关性/regime/驱动归因) ----------------
 # 与日线 ETF 策略互补: 服务周级/月级行情判断。一切皆"序列"(ETF/行业指数/港股/商品/宏观/气候),
