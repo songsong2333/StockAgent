@@ -248,11 +248,13 @@ def efficiency_ratio(close: pd.Series, n: int = 30) -> pd.Series:
 
 def backtest_trend_follow(min_df: pd.DataFrame, market_min_df: pd.DataFrame, cfg: dict,
                           donchian: int = None, er_n: int = None, er_min: float = None,
-                          atr_mult: float = None, cost: float = DEFAULT_COST) -> dict:
-    """v2 趋势跟踪回测。进场=日线conviction(硬门槛)+Donchian突破+ER趋势质量;
+                          atr_mult: float = None, vol_mult: float = None,
+                          cost: float = DEFAULT_COST) -> dict:
+    """v2 趋势跟踪回测。进场=日线conviction(硬门槛)+Donchian突破+ER趋势质量(+可选放量确认);
     离场=ATR移动止损(最高收盘回撤 atr_mult×ATR)+日线转弱。让利润奔跑, 确认反转才走。
 
     参数缺省读 config.entry_exit(donchian/er_n/er_min/atr_trail_mult)。
+    vol_mult: 非 None 时要求突破 bar 放量(volume > vol_mult×均量20), 即"放量才是真突破/主力进场"。
     无未来: 信号 bar i-1 评估, bar i 开盘执行; 日线用前一日状态。
     """
     ee = cfg["entry_exit"]
@@ -260,6 +262,8 @@ def backtest_trend_follow(min_df: pd.DataFrame, market_min_df: pd.DataFrame, cfg
     er_n = er_n or ee.get("er_n", 30)
     er_min = ee.get("er_min", 0.35) if er_min is None else er_min
     atr_mult = atr_mult or ee.get("atr_trail_mult", 4.0)
+    if vol_mult is None:
+        vol_mult = ee.get("vol_mult_entry", None)     # 未配置=不启用放量确认
     d = add_min_indicators(min_df, cfg)
     daily_self = resample_daily(min_df)
     daily_mkt = resample_daily(market_min_df)
@@ -269,6 +273,8 @@ def backtest_trend_follow(min_df: pd.DataFrame, market_min_df: pd.DataFrame, cfg
     d["dc_prev"] = d["high"].shift(1).rolling(donchian).max()
     d["er"] = efficiency_ratio(d["close"], er_n)
     d["entry_sig"] = d["hard_gate"] & (d["close"] > d["dc_prev"]) & (d["er"] > er_min)
+    if vol_mult is not None:                       # 放量确认: 突破须有量(主力进场代理)
+        d["entry_sig"] = d["entry_sig"] & (d["volume"] > vol_mult * d["vol_ma"])
     d["dailyweak"] = daily_below_short_state(d, daily_self, ee["daily_ma_short"])
 
     opens, lows, closes = d["open"].values, d["low"].values, d["close"].values
@@ -314,7 +320,7 @@ def backtest_trend_follow(min_df: pd.DataFrame, market_min_df: pd.DataFrame, cfg
 def backtest_daily_trend(self_df: pd.DataFrame, market_df: pd.DataFrame,
                          ma_gate: int = 60, ma_trend: int = 20, donchian: int = 20,
                          er_n: int = 30, er_min: float = 0.30, atr_mult: float = 4.0,
-                         cost: float = 0.0005) -> dict:
+                         vol_mult: float = None, cost: float = 0.0005) -> dict:
     """v2 逻辑的日线版(验证回撤保护, 用含熊市的长历史)。
 
     进场=大盘闸门(market 日线多头, 前一日)+自身趋势(close>MA_gate)+Donchian突破+ER;
@@ -337,6 +343,9 @@ def backtest_daily_trend(self_df: pd.DataFrame, market_df: pd.DataFrame,
     gate = m.set_index("date")["m_up"].reindex(d["date"]).shift(1).fillna(False)
     d["c_market"] = gate.values
     d["entry_sig"] = d["c_market"] & d["self_trend"] & (d["close"] > d["dc_prev"]) & (d["er"] > er_min)
+    if vol_mult is not None:                       # 放量确认
+        d["vol_ma"] = d["volume"].rolling(20).mean()
+        d["entry_sig"] = d["entry_sig"] & (d["volume"] > vol_mult * d["vol_ma"])
 
     opens, lows, closes = d["open"].values, d["low"].values, d["close"].values
     atrs, entries = d["atr"].values, d["entry_sig"].values
