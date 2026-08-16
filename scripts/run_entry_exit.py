@@ -28,11 +28,15 @@ def main():
     cfg = load_config()
 
     if not args.no_collect:
-        from collector.index_min_collector import update_all_min
+        from collector.index_min_collector import update_all_min, update_arsenal_daily
         log.info("更新指数 60min 数据...")
         ok, failed = update_all_min(cfg)
         if failed:
-            log.warning(f"部分指数采集失败: {failed}(用现有缓存出信号)")
+            log.warning(f"部分 60min 采集失败: {failed}(用现有缓存)")
+        log.info("更新指数武器库(各大指数日线)...")
+        ok2, failed2 = update_arsenal_daily(cfg)
+        if failed2:
+            log.warning(f"部分武器库采集失败: {failed2}(用现有缓存)")
 
     from strategy.entry_exit import generate_live_signals, signals_to_text
     signals = generate_live_signals(cfg)

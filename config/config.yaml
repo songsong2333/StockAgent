@@ -12,6 +12,7 @@ paths:
   hk_dir: data/hk              # 港股日线 parquet(周期探索平台用, 走新浪 stock_hk_daily)
   store_dir: data/store        # 统一序列存储: 替代数据(宏观/能源/商品/气候)月频 parquet
   index_min_dir: data/index_min # 指数60min K线(进出场系统用, 新浪 stock_zh_a_minute)
+  index_daily_dir: data/index_daily # 指数武器库: 各大指数日线(每日持续采集, 未来策略弹药)
 
 # ---------------- 数据采集 ----------------
 collector:
@@ -93,6 +94,16 @@ entry_exit:
     - {index: "sh000688", etf: "588870", name: "科创50"}
   defense: {etf: "515180", name: "红利100"}   # 防守仓位, 成长离场时切入
   market: "sh000300"             # 大盘环境闸门(沪深300)
+  # 每日信号组合(纳指重 + 新能源分散; 创业板/科创50 保留监控)。freq: daily=日线武器库, min=60min。
+  # 回测依据(2016-2026): 纳指买持16.8%/回撤-36% · 新能源趋势13.2%/-15% · 组合50/50约16%/-13%。
+  portfolio:
+    # mode=crash_guard: 轻择时防崩(默认持有, 跌破crash_ma_long避险, 美债倒挂预警)。纳指买持12.2%/-55%,
+    #   MA200防崩后 9.5%/-26%(2000-2026回测), 用约2.7pp年化换回撤减半。
+    - {symbol: ".IXIC",    name: "纳指",   freq: "daily", mode: "crash_guard", etf: "159509", weight: 0.5, role: "core"}
+    - {symbol: "sz399808", name: "新能源", freq: "daily", mode: "trend",       etf: "516160", weight: 0.5, role: "satellite"}
+    - {symbol: "sz399006", name: "创业板", freq: "min",   mode: "trend",       etf: "159915", weight: 0.0, role: "watch"}
+    - {symbol: "sh000688", name: "科创50", freq: "min",   mode: "trend",       etf: "588870", weight: 0.0, role: "watch"}
+  crash_ma_long: 200             # 纳指防崩均线(跌破避险)。实测MA200最优, MA250回撤略低但收益更低
   # 日线 conviction(确定性根基)
   daily_ma_short: 20
   daily_ma_long: 60

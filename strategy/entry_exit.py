@@ -379,7 +379,34 @@ def backtest_daily_trend(self_df: pd.DataFrame, market_df: pd.DataFrame,
     ret = d["close"].pct_change().fillna(0.0)
     pos_flag = pd.Series(in_mkt, index=d["date"]).shift(1).fillna(False)   # 前一日持仓决定今日吃收益
     nav = (1 + ret * pos_flag.values).cumprod()
-    return {"trades": pd.DataFrame(trades), "nav": nav, "in_mkt": pos_flag, "dates": d["date"]}
+    return {"trades": pd.DataFrame(trades), "nav": nav, "in_mkt": pos_flag, "dates": d["date"],
+            "annotated": d, "in_pos": pd.Series(in_mkt, index=d["date"])}
+
+
+def backtest_crash_guard(index_df: pd.DataFrame, ma_long: int = 200,
+                         yield_spread: pd.Series = None, cost: float = 0.0005) -> dict:
+    """纳指"轻择时"防崩: 默认持有, 收盘跌破 MA_long 离场避险, 收复 MA_long 再进。
+
+    设计依据(2000-2026 回测): MA200 趋势破位把纳指回撤 -55.6% 砍到 -26.3%, 年化 12.2%→9.5%;
+    收益率曲线倒挂**单独择时失效**(危机爆发时降息致曲线重新变陡), 故只作预警旗不作硬离场。
+    yield_spread: 美债10y-2y 利差 Series(按日期索引); 提供时输出倒挂预警 crash_alert。
+    无未来: 仓位用前一日状态(shift(1)); 预警用前一日利差。
+    """
+    d = index_df.copy().reset_index(drop=True)
+    d["date"] = pd.to_datetime(d["date"])
+    d["ma_l"] = d["close"].rolling(ma_long).mean()
+    above = d["close"] > d["ma_l"]
+    in_pos = above.shift(1).fillna(False)                 # 前一日收盘在MA上 -> 今日持有
+    ret = d["close"].pct_change().fillna(0.0)
+    nav = (1 + ret * in_pos.values).cumprod()
+    d["crash_alert"] = False
+    if yield_spread is not None and len(yield_spread):
+        sp = yield_spread.reindex(d["date"]).shift(1)      # 前一日利差
+        d["crash_alert"] = (sp < 0).fillna(False).values
+    # 交易记录(供统计): 上穿MA进, 下穿MA出
+    d["edge_up"] = above & ~above.shift(1).fillna(False)
+    d["edge_dn"] = ~above & above.shift(1).fillna(True)
+    return {"nav": nav, "in_pos": pd.Series(in_pos.values, index=d["date"]), "annotated": d}
 
 
 def backtest_rotation(growth_df: pd.DataFrame, market_df: pd.DataFrame,
@@ -410,71 +437,118 @@ def backtest_rotation(growth_df: pd.DataFrame, market_df: pd.DataFrame,
     return {"nav": nav, "in_mkt": hold_growth, "dates": dates, "trades": res["trades"]}
 
 
-def generate_live_signals(cfg: dict) -> list:
-    """实盘进攻信号(纯进攻, 无防守): 读最新 60min, 输出每个成长板当前状态。
+def _state_from_result(res: dict, atr_mult: float) -> dict:
+    """从回测结果提取当前状态(action/trail_stop/...), 60min 与日线通用。"""
+    ann, in_pos, trades = res["annotated"], res["in_pos"], res["trades"]
+    last = ann.iloc[-1]
+    holding = bool(in_pos.iloc[-1])
+    entry_sig = bool(last.get("entry_sig", False))
+    just_exited = (not trades.empty and trades.iloc[-1]["reason"] != "eod"
+                   and pd.Timestamp(trades.iloc[-1]["exit_date"]) == pd.Timestamp(last["date"]))
+    action = "持有" if holding else ("刚离场" if just_exited else ("进场" if entry_sig else "观望"))
+    trail = None
+    if holding:
+        hh = ann.loc[in_pos, "close"].max()
+        atr_now = last["atr"] if np.isfinite(last.get("atr", np.nan)) else last["close"] * 0.02
+        trail = float(hh - atr_mult * atr_now)
+    conv = last.get("hard_gate", last.get("self_trend", False))
+    return {"action": action, "close": float(last["close"]), "conviction": bool(conv),
+            "er": float(last["er"]) if np.isfinite(last.get("er", np.nan)) else None,
+            "trail_stop": trail, "as_of": pd.Timestamp(last["date"])}
 
-    每板返回 dict: board/etf/action(进场/持有/观望/刚离场)/close/conviction/er/trail_stop/...
-    action 语义: 进场=最新bar触发v2进场(下根开盘杀入); 持有=当前在场内(附移动止损位);
-                 观望=空仓无信号; 刚离场=最新bar触发离场。
+
+def _crash_state(res: dict) -> dict:
+    """纳指防崩状态: 收盘在 MA_long 上=持有, 跌破=避险; crash_alert=美债曲线倒挂预警。"""
+    ann = res["annotated"]
+    last = ann.iloc[-1]
+    above = bool(last["close"] > last["ma_l"])
+    return {"action": "持有" if above else "避险", "close": float(last["close"]),
+            "conviction": above, "ma_long": float(last["ma_l"]) if np.isfinite(last["ma_l"]) else None,
+            "crash_alert": bool(last.get("crash_alert", False)), "er": None, "trail_stop": None,
+            "as_of": pd.Timestamp(last["date"])}
+
+
+def generate_live_signals(cfg: dict) -> list:
+    """实盘组合信号: 读 config.entry_exit.portfolio, 逐标的出信号。
+
+    mode=crash_guard: 纳指轻择时防崩(跌破MA_long避险 + 美债倒挂预警)。
+    mode=trend + freq=daily: 日线武器库 v2 趋势; freq=min: 60min v2 趋势。
     """
-    from collector.index_min_collector import load_index_min
+    from collector.index_min_collector import load_index_min, load_arsenal, load_us_yield
     ee = cfg["entry_exit"]
-    market_sym = ee.get("market")
-    market = load_index_min(cfg, market_sym)
+    portfolio = ee.get("portfolio", [])
+    if not portfolio:                                   # 兼容旧配置(仅 growth)
+        portfolio = [{"symbol": g["index"], "name": g["name"], "etf": g.get("etf", ""),
+                      "freq": "min", "mode": "trend", "weight": 0.0, "role": "watch"}
+                     for g in ee.get("growth", [])]
+    market_min = load_index_min(cfg, ee.get("market"))  # 60min 大盘闸门(给 min 标的)
+    us_yield = load_us_yield(cfg)                       # 金融危机因子(美债利差)
+    atr_mult = ee.get("atr_trail_mult", 4.0)
     out = []
-    for g in ee.get("growth", []):
-        sym, name, etf = g["index"], g["name"], g.get("etf", "")
-        m = load_index_min(cfg, sym)
-        if m.empty or market.empty:
-            out.append({"board": name, "etf": etf, "action": "无数据", "close": None})
-            continue
-        res = backtest_trend_follow(m, market, cfg)
-        ann, in_pos, trades = res["annotated"], res["in_pos"], res["trades"]
-        last = ann.iloc[-1]
-        holding = bool(in_pos.iloc[-1])
-        entry_sig = bool(last["entry_sig"])
-        exit_sig = bool(last.get("dailyweak", False))
-        # 最新一根是否刚离场(最后一笔交易 exit 落在最后bar)
-        just_exited = (not trades.empty and trades.iloc[-1]["reason"] != "eod"
-                       and pd.Timestamp(trades.iloc[-1]["exit_date"]) == pd.Timestamp(last["date"]))
-        if holding:
-            action = "持有"
-        elif just_exited:
-            action = "刚离场"
-        elif entry_sig:
-            action = "进场"
-        else:
-            action = "观望"
-        # 持仓时的移动止损位(持仓期最高收盘 - atr_mult×ATR)
-        trail = None
-        if holding and not trades.empty:
-            hh = ann.loc[in_pos, "close"].max()
-            atr_now = last["atr"] if np.isfinite(last["atr"]) else last["close"] * 0.02
-            trail = float(hh - ee.get("atr_trail_mult", 4.0) * atr_now)
-        out.append({
-            "board": name, "etf": etf, "action": action,
-            "close": float(last["close"]), "conviction": bool(last["hard_gate"]),
-            "er": float(last["er"]) if np.isfinite(last["er"]) else None,
-            "trail_stop": trail, "as_of": pd.Timestamp(last["date"]),
-        })
+    for p in portfolio:
+        sym, name = p["symbol"], p["name"]
+        etf, freq = p.get("etf", ""), p.get("freq", "min")
+        weight, role = p.get("weight", 0.0), p.get("role", "")
+        mode = p.get("mode", "trend")
+        try:
+            if mode == "crash_guard":
+                df = load_arsenal(cfg, sym)
+                if df.empty:
+                    raise ValueError("no data")
+                res = backtest_crash_guard(df, ma_long=ee.get("crash_ma_long", 200),
+                                           yield_spread=us_yield)
+                st = _crash_state(res)
+            elif freq == "daily":
+                df = load_arsenal(cfg, sym)
+                if df.empty:
+                    raise ValueError("no data")
+                res = backtest_daily_trend(df, df, er_min=ee.get("er_min_daily", 0.30),
+                                           atr_mult=atr_mult, vol_mult=ee.get("vol_mult_entry"))
+                st = _state_from_result(res, atr_mult)
+            else:
+                df = load_index_min(cfg, sym)
+                if df.empty or market_min.empty:
+                    raise ValueError("no data")
+                res = backtest_trend_follow(df, market_min, cfg)
+                st = _state_from_result(res, atr_mult)
+            out.append({"board": name, "etf": etf, "weight": weight, "role": role,
+                        "freq": freq, "mode": mode, **st})
+        except Exception as e:
+            log.warning(f"{name}({sym}) 信号生成失败: {e}")
+            out.append({"board": name, "etf": etf, "weight": weight, "role": role,
+                        "freq": freq, "mode": mode, "action": "无数据", "close": None})
     return out
 
 
 def signals_to_text(signals: list) -> str:
     """实盘信号转可读文本(CLI/推送用)。"""
-    icon = {"进场": "🟢 杀入", "持有": "🔵 持有", "观望": "⚪ 观望", "刚离场": "🔴 刚离场", "无数据": "⚠️ 无数据"}
-    lines = ["📡 成长板进攻信号 (v2: 日线强势闸门 + 60min突破 + ER趋势质量 + ATR移动止损)"]
+    icon = {"进场": "🟢 杀入", "持有": "🔵 持有", "观望": "⚪ 观望", "刚离场": "🔴 刚离场",
+            "避险": "🛡️ 避险", "无数据": "⚠️ 无数据"}
+    lines = ["📡 组合信号 (纳指轻择时防崩 + 新能源趋势 | 突破+ER+放量+ATR移动止损)"]
+    alerts = []
     for s in signals:
-        head = f"{icon.get(s['action'], s['action'])} {s['board']}({s['etf']})"
+        w = f" | 配比{s['weight']:.0%}" if s.get("weight") else ""
+        head = f"{icon.get(s['action'], s['action'])} {s['board']}({s['etf']}){w}"
         if s["action"] == "无数据":
-            lines.append(head + " — 缺 60min 数据, 先采集"); continue
-        detail = f"收盘 {s['close']:.0f} | 日线强势 {'✓' if s['conviction'] else '✗'} | ER {s['er']:.2f}" if s["er"] is not None else ""
-        if s["action"] == "持有" and s["trail_stop"]:
-            detail += f" | 移动止损 {s['trail_stop']:.0f}(跌破离场)"
-        if s["action"] == "进场":
-            detail += " | 强势+突破确认, 下根开盘杀入"
-        lines.append(f"{head} — {detail} | {s['as_of']:%m-%d %H:%M}")
-    lines.append("\n⚠️ 仅进攻信号, 无防守切换; 低频高确定性思路, 非投资建议。")
+            lines.append(head + " — 缺数据, 先采集"); continue
+        detail = f"收盘 {s['close']:.2f}"
+        if s.get("mode") == "crash_guard":
+            detail += f" | MA{s.get('ma_long', 0):.0f} {'上方✓' if s['conviction'] else '跌破✗→避险'}"
+            if s.get("crash_alert"):
+                detail += " | 🚨美债曲线倒挂(衰退预警)"
+                alerts.append(s["board"])
+        else:
+            detail += f" | 趋势{'✓' if s['conviction'] else '✗'}"
+            if s["er"] is not None:
+                detail += f" | ER {s['er']:.2f}"
+            if s["action"] == "持有" and s["trail_stop"]:
+                detail += f" | 移动止损 {s['trail_stop']:.2f}(跌破离场)"
+            if s["action"] == "进场":
+                detail += " | 强势确认, 下根开盘杀入"
+        lines.append(f"{head} — {detail} | {s['as_of']:%m-%d}")
+    if alerts:
+        lines.append(f"\n🚨 金融危机预警: 美债收益率曲线倒挂中(历史每次衰退前均倒挂), 注意 {', '.join(alerts)} 风险敞口。")
+    lines.append("\n⚠️ 低频确定性思路; 纳指=轻择时(跌破MA200才避险), 进攻板=严格趋势。非投资建议。")
     return "\n".join(lines)
 
 

@@ -15,6 +15,7 @@ data/etf/
 data/hk/
 data/store/
 data/index_min/
+data/index_daily/
 data/cache/
 !data/cache/.gitkeep
 # 注: data/knowledge/laws.yaml 是规律知识库(小 YAML), 保留入库

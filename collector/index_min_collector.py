@@ -190,6 +190,131 @@ def load_defense(cfg: dict) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
+# ============== 指数武器库: 每日持续采集各大指数日线(未来策略的数据弹药) ==============
+INDEX_ARSENAL = {
+    # 宽基/成长 (A股)
+    "sh000300": "沪深300", "sh000016": "上证50", "sh000905": "中证500",
+    "sh000852": "中证1000", "sz399006": "创业板指", "sh000688": "科创50",
+    # 行业/主题 (A股)
+    "sz399808": "新能源", "sz399554": "电力", "sz399998": "煤炭",
+    "sz399395": "有色", "sz399440": "钢铁", "sz399807": "券商",
+    "sz399812": "白酒", "sz399971": "传媒",
+    # 美股
+    ".IXIC": "纳指综合",
+}
+
+
+def _arsenal_dir(cfg: dict) -> Path:
+    d = cfg.get("paths", {}).get("index_daily_dir", "data/index_daily")
+    p = Path(d)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
+def _safe_name(symbol: str) -> str:
+    return symbol.replace(".", "_").replace("^", "")
+
+
+def fetch_index_daily(symbol: str, max_retries: int = 3, sleep: float = 1.0) -> pd.DataFrame:
+    """拉取单只指数日线。A股走 stock_zh_index_daily, 美股('.'开头)走 index_us_stock_sina。"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            if symbol.startswith("."):
+                df = ak.index_us_stock_sina(symbol=symbol)
+            else:
+                df = ak.stock_zh_index_daily(symbol=symbol)
+            if df is None or df.empty:
+                break
+            df = df.copy()
+            if "date" not in df.columns:
+                df = df.reset_index()
+            df["date"] = pd.to_datetime(df["date"])
+            for c in ("open", "high", "low", "close", "volume"):
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+            keep = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
+            df = df[keep].sort_values("date").drop_duplicates("date").reset_index(drop=True)
+            time.sleep(sleep)
+            return df
+        except Exception as e:
+            log.debug(f"{symbol} 指数日线第{attempt}次失败: {e}")
+            time.sleep(2.0 * attempt)
+    log.warning(f"{symbol} 指数日线采集失败")
+    return pd.DataFrame()
+
+
+def update_arsenal_daily(cfg: dict, symbols: list = None) -> tuple:
+    """每日增量更新指数武器库。返回 (成功数, 失败列表)。"""
+    symbols = symbols or list(INDEX_ARSENAL.keys())
+    d = _arsenal_dir(cfg)
+    ensure_dir(d)
+    ok, failed = 0, []
+    for sym in symbols:
+        try:
+            new = fetch_index_daily(sym)
+            if new.empty:
+                failed.append(sym)
+                continue
+            path = d / f"{_safe_name(sym)}.parquet"
+            old = pd.read_parquet(path) if path.exists() else pd.DataFrame()
+            comb = pd.concat([old, new], ignore_index=True) if not old.empty else new
+            comb = comb.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+            comb.to_parquet(path, index=False)
+            ok += 1
+        except Exception as e:
+            log.warning(f"{sym} 武器库更新异常: {e}")
+            failed.append(sym)
+        time.sleep(cfg.get("collector", {}).get("request_sleep", 0.8))
+    if not update_us_yield(cfg):                 # 金融危机因子: 美债利差
+        failed.append("us_yield_spread")
+    log.info(f"指数武器库采集: {ok}/{len(symbols)} 成功, 失败 {failed}")
+    return ok, failed
+
+
+def load_arsenal(cfg: dict, symbol: str) -> pd.DataFrame:
+    path = _arsenal_dir(cfg) / f"{_safe_name(symbol)}.parquet"
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
+
+
+# ============== 金融危机因子: 美债收益率曲线(10年-2年利差, 衰退/危机领先预警) ==============
+def fetch_us_yield_spread(max_retries: int = 3, sleep: float = 1.0) -> pd.DataFrame:
+    """美债 2年/10年/10y-2y 利差(东财 bond_zh_us_rate, 1990~今)。利差<0=曲线倒挂=衰退预警。"""
+    for attempt in range(1, max_retries + 1):
+        try:
+            df = ak.bond_zh_us_rate()
+            df["date"] = pd.to_datetime(df["日期"])
+            out = df[["date", "美国国债收益率2年", "美国国债收益率10年", "美国国债收益率10年-2年"]].copy()
+            out.columns = ["date", "us_2y", "us_10y", "us_10y2y"]
+            for c in ("us_2y", "us_10y", "us_10y2y"):
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+            out = out.dropna(subset=["us_10y2y"]).sort_values("date").reset_index(drop=True)
+            time.sleep(sleep)
+            return out
+        except Exception as e:
+            log.debug(f"美债利差第{attempt}次失败: {e}")
+            time.sleep(2.0 * attempt)
+    log.warning("美债利差采集失败")
+    return pd.DataFrame()
+
+
+def update_us_yield(cfg: dict) -> bool:
+    df = fetch_us_yield_spread()
+    if df.empty:
+        return False
+    d = _arsenal_dir(cfg)
+    ensure_dir(d)
+    df.to_parquet(d / "us_yield_spread.parquet", index=False)
+    log.info(f"美债利差缓存 {len(df)}行 ~{df['date'].max().date()}")
+    return True
+
+
+def load_us_yield(cfg: dict) -> pd.DataFrame:
+    path = _arsenal_dir(cfg) / "us_yield_spread.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    return df.set_index(pd.to_datetime(df["date"]))["us_10y2y"]
+
+
 if __name__ == "__main__":
     from common import load_config
     cfg = load_config()
